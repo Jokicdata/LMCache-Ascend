@@ -30,6 +30,7 @@ In the table above, “hybrid KV cache management formats” means **MLA/DSA mul
 
 ## Documents
 
+- [code_call_graph_zh.md](code_call_graph_zh.md) — 中文代码调用图：从请求入口到 KV Cache 分配、注册、搬运与释放（面向新手）。
 - [lmcache_driven.md](lmcache_driven.md) — the `lmcache_driven` transfer mode full deployment guide: environment preparation, container startup, source installation, server/vLLM startup, and verification (DeepSeek-V4 example).
 - [engine_driven.md](engine_driven.md) — deploy and run the `engine_driven` transfer mode (Qwen3 example).
 - [qwen3_5.md](qwen3_5.md) — hybrid Mamba models (for example Qwen3.5, Qwen3.6, and Qwen3.8) on Ascend: same flags as the [LMCache recipe](https://docs.lmcache.ai/recipes/qwen3_5.html), plus the Ascend differences.

@@ -20,7 +20,10 @@ class SglangPatcher(BasePatcher):
 
     @classmethod
     def apply_all(cls) -> bool:
-        """Main entry point: apply all SGLang specific patches."""
+        """Main entry point: apply all SGLang specific patches.
+        中文导读：无业务输入，返回是否成功应用补丁。调用方向为 Ascend 集成初始化 →
+        本入口 → 定位 SGLang 文件并执行内存池补丁，使 SGLang 初始化时导入本适配层。
+        """
         try:
             version = cls.get_version("sglang")
 
@@ -30,6 +33,7 @@ class SglangPatcher(BasePatcher):
             )
 
             # Resolve the file path dynamically based on installed sglang package
+            # 中文：根据已安装的 SGLang 包动态解析目标文件路径。
             model_runner_path = cls._find_sglang_file()
             if not model_runner_path:
                 logger.error("Could not locate sglang model_runner or mixin file.")
@@ -52,7 +56,10 @@ class SglangPatcher(BasePatcher):
 
     @classmethod
     def _find_sglang_file(cls) -> Path | None:
-        """Find the relevant file across different SGLang versions."""
+        """Find the relevant file across different SGLang versions.
+        中文导读：无显式业务输入，返回兼容当前 SGLang 版本的目标模块路径；
+        调用方向为 ``apply_all`` → 本函数 → 按候选顺序探测模块位置。
+        """
         candidates = [
             "sglang.srt.model_executor.model_runner_kv_cache_mixin",
             "sglang.srt.model_executor.model_runner",
@@ -84,6 +91,9 @@ class SglangPatcher(BasePatcher):
                     if self.use_mla_backend:
                         self.token_to_kv_pool = AscendMLAPagedTokenToKVPool(
                             self.max_total_num_tokens,
+        中文导读：输入 ``path`` 为待补丁的 SGLang 源文件，返回是否完成或检测到补丁。
+        调用方向为 ``apply_all`` → 本函数 → 在 ``init_memory_pool`` 的 Ascend 分支
+        注入 ``lmcache_ascend`` 导入，从而接通连接器构造及后续 load/store 调用链。
         """
         lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
         changed = False
@@ -98,6 +108,7 @@ class SglangPatcher(BasePatcher):
         for i in range(block[0], block[1]):
             if target_trigger in lines[i]:
                 # Avoid double patching
+                # 中文：避免重复应用同一补丁。
                 if i + 1 < len(lines) and "enable_lmcache" in lines[i + 1]:
                     logger.info(f"File {path} is already patched.")
                     return True

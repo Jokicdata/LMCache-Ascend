@@ -29,8 +29,15 @@ def GPUMemoryAllocator__init__(
     """
     :param int size: The size of the GPU memory in bytes.
     :param Optional[int] align_bytes: The byte alignment for allocations.
+
+    中文导读：输入 ``size`` 为预分配字节数，``device`` 为首选设备，
+    ``align_bytes`` 控制对齐，``use_paging`` 决定采用分页还是普通张量分配器；
+    无显式返回值，但会建立底层字节张量和后续 ``allocate`` 所用的分配器。
+    调用方向为 NPU connector 的懒初始化 → 本构造函数 → NPU/CPU 内存分配；
+    后续 connector 通过 ``allocate`` 取得传输缓冲 ``MemoryObj``。
     """
     # NOTE(niming): torch.cuda.is_available() is mocked to False by sglang.
+    # 中文：SGLang 会把 torch.cuda.is_available() 模拟为 False。
     if not torch.npu.is_available():
         device = "cpu"
 

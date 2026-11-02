@@ -15,6 +15,18 @@
 //     fails with "nothing started", never half-enqueued.
 //   - The kernel is a pure byte mover; there is no packed/two-plane special
 //     case and no dtype dispatch left in this file.
+// MP 模式 block 级 KV 传输的 C++ host 层（与上游 LMCache
+// csrc/mp_mem_kernels.cu 一致）。
+//
+// 设计契约：
+//   - prepare_group 将 PageBufferShapeDesc 和 EngineKVFormat 解析为扁平的
+//     BlockTransferLayout POD，每组仅解析一次，并完成所有静态几何检查。
+//     两个 native 入口都只使用 PreparedGroup；设备 kernel 原样接收 POD，
+//     不再解释格式。
+//   - validate_launch 校验每次传输的动态变量。
+//   - 计划执行器在任何 staging 拷贝或 kernel 入队前校验所有 group 和
+//     launch：不支持的 group 会在“尚未开始任何操作”时失败，不会只入队一半。
+//   - kernel 只负责字节搬运；此文件不保留 packed/双 plane 特例或 dtype 分派。
 
 #include "mp_mem_kernels.h"
 
@@ -31,12 +43,16 @@ namespace {
 
 // DataCopy granularity on the GM side: segment base addresses and segment
 // byte lengths must both be multiples of 32B.
+// GM 侧 DataCopy 的粒度：段基地址和段字节长度都必须是 32B 的整数倍。
 constexpr int64_t kGmAlignBytes = 32;
 // Single UB segment budget: the depth-2 queue must hold two segments, so one
 // segment may use at most half of the total budget.
+// 单个 UB 段预算：深度为 2 的队列必须能容纳两个段，因此单段最多使用
+// 总预算的一半。
 constexpr int64_t kUbSegmentBytes =
     kvcache_ops::kBlockTransferUbBytes / kvcache_ops::kBlockTransferQueueDepth;
 // DataCopyPad GM-side gap fields are uint32.
+// DataCopyPad 的 GM 侧间隔字段为 uint32。
 constexpr int64_t kCopyGmGapMax =
     static_cast<int64_t>(std::numeric_limits<uint32_t>::max());
 
@@ -61,6 +77,8 @@ int64_t checked_add(int64_t a, int64_t b, const char *what) {
 // Usable per-AIV UB staging budget, queried from the platform: GetCoreMemSize
 // reports the PHYSICAL UB size. Returns 0 on failure -- callers then use
 // the kernel's built-in 128KB default.
+// 从平台查询每个 AIV 可用的 UB staging 预算：GetCoreMemSize 报告物理 UB
+// 大小。查询失败时返回 0，调用方随后使用 kernel 内置的 128KB 默认值。
 int64_t query_ub_budget_bytes() {
   auto *platform =
       platform_ascendc::PlatformAscendCManager::GetInstance(aclrtGetSocName());
@@ -75,18 +93,25 @@ int64_t query_ub_budget_bytes() {
 // ---------------------------------------------------------------------------
 // prepare_group: static geometry, resolved once per group.
 // ---------------------------------------------------------------------------
+// prepare_group：静态几何信息，每组只解析一次。
 
+// 保存 host 端预解析结果，包括设备侧字节布局、指针表寻址方式和 UB 预算。
 struct PreparedGroup {
   kvcache_ops::BlockTransferLayout layout{};
   bool separate_plane = false; // format 16: (layer, plane, block) work items
+                               // 格式 16：工作项为（layer, plane, block）
   bool one_pointer_per_layer = false; // format 2: ptrs[layer] + plane offset
+                                      // 格式 2：ptrs[layer] 加 plane 偏移
   int32_t nl = 0;
   int32_t nb = 0;
   int32_t bs = 0;
   int64_t slots_per_object = 0;
   int64_t ub_bytes = 0; // queried UB budget; 0 = kernel default
+                        // 查询到的 UB 预算；0 表示使用 kernel 默认值
 };
 
+// 将形状描述和引擎格式归一化为设备布局，集中校验 plane、步长、地址范围及
+// UB 分段约束；后续 launch 不再重复解释这些静态格式。
 PreparedGroup prepare_group(const PageBufferShapeDesc &shape_desc,
                             EngineKVFormat engine_kv_format,
                             int64_t slots_per_object, int64_t ub_bytes) {
@@ -95,6 +120,9 @@ PreparedGroup prepare_group(const PageBufferShapeDesc &shape_desc,
   // stays one base pointer per layer; plane addresses are base + offset.
   // Axis 1 is two equal slabs (semantic K/V, or opaque page halves).
   // Its LMC geometry matches format 16.
+  // 格式 2 每层是一个 [NB, 2, BS, NH, HS] Tensor。指针表仍按每层一个基址，
+  // plane 地址为基址加偏移。第 1 轴是两个等大的 slab（语义上的 K/V，或
+  // 不透明页的两半）。其 LMC 几何布局与格式 16 相同。
   const bool fmt2 = engine_kv_format == EngineKVFormat::NL_X_NB_TWO_BS_NH_HS;
   const bool fmt13 = engine_kv_format == EngineKVFormat::NL_X_NB_BS_NH_CS;
   const bool separate =
@@ -124,6 +152,8 @@ PreparedGroup prepare_group(const PageBufferShapeDesc &shape_desc,
     // Format 13 is one fused [NB, BS, NH, CS] tensor per layer. Its plane
     // geometry is fully determined by the scalar descriptor fields, so no
     // per-plane tensor introspection is needed during registration.
+    // 格式 13 每层是一个融合的 [NB, BS, NH, CS] Tensor。其 plane 几何完全
+    // 由标量描述字段决定，因此注册时无需逐个 plane 检查 Tensor。
     sd.num_planes = 1;
     sd.plane_slot_bytes[0] = scalar_row;
     sd.plane_block_stride_bytes[0] =
@@ -135,6 +165,8 @@ PreparedGroup prepare_group(const PageBufferShapeDesc &shape_desc,
 
   // Format 2 is one [NB, 2, BS, NH, HS] tensor. The scalar descriptor
   // fixes both plane addresses, so fill them here.
+  // 格式 2 是一个 [NB, 2, BS, NH, HS] Tensor。标量描述符已确定两个 plane
+  // 的地址，因此在此填充。
   if (fmt2) {
     const int64_t row =
         checked_mul(checked_mul(static_cast<int64_t>(sd.nh), sd.hs, "nh * hs"),
@@ -160,6 +192,8 @@ PreparedGroup prepare_group(const PageBufferShapeDesc &shape_desc,
 
   // Formats 16/17 must carry explicit plane geometry filled at registration;
   // format 13 derives it above when num_planes == 0.
+  // 格式 16/17 必须携带注册时填充的显式 plane 几何；格式 13 在
+  // num_planes == 0 时由上述逻辑推导。
   TORCH_CHECK(sd.num_planes >= 1 && sd.num_planes <= kvcache_ops::kMaxPlanes,
               "num_planes must be in [1, ", kvcache_ops::kMaxPlanes,
               "] after resolving plane geometry, got ", sd.num_planes);
@@ -185,6 +219,8 @@ PreparedGroup prepare_group(const PageBufferShapeDesc &shape_desc,
   group.layout.num_planes = sd.num_planes;
   // Per-segment budget: host-queried UB (query_ub_budget_bytes) or the
   // built-in default; the kernel receives the same ub_bytes.
+  // 单段预算：使用 host 查询的 UB（query_ub_budget_bytes）或内置默认值；
+  // kernel 接收相同的 ub_bytes。
   const int64_t ub_segment =
       ub_bytes > 0 ? ub_bytes / kvcache_ops::kBlockTransferQueueDepth
                    : kUbSegmentBytes;
@@ -207,6 +243,7 @@ PreparedGroup prepare_group(const PageBufferShapeDesc &shape_desc,
                 " for DataCopy alignment");
     // Address-range overflow probe: (nb - 1) * stride + span must stay
     // inside int64.
+    // 地址范围溢出检查：(nb - 1) * stride + span 必须仍在 int64 范围内。
     checked_add(checked_mul(sd.nb - 1, block_stride, "plane address range"),
                 span, "plane address range");
     if (!fmt17) {
@@ -216,6 +253,8 @@ PreparedGroup prepare_group(const PageBufferShapeDesc &shape_desc,
     }
     // LMC packed-row gap = bytes of the OTHER planes in the row; it feeds a
     // uint32 DataCopyPad field (engine-side gap is always 0: dense rows).
+    // LMC packed 行间隔等于同一行中其他 plane 的字节数；该值写入 uint32
+    // DataCopyPad 字段（引擎侧为紧凑行，间隔始终为 0）。
     TORCH_CHECK(scalar_row >= payload && scalar_row - payload <= kCopyGmGapMax,
                 "plane ", p, " LMC row gap (", scalar_row - payload,
                 ") exceeds the DataCopyPad GM gap range");
@@ -229,6 +268,7 @@ PreparedGroup prepare_group(const PageBufferShapeDesc &shape_desc,
                   " offset + block span (", reach,
                   ") exceeds the block stride (", block_stride, ")");
       // The probe above starts at offset 0. Format 2 also reaches base_offset.
+      // 上述检查从偏移 0 开始；格式 2 的访问范围还会到达 base_offset。
       checked_add(checked_mul(sd.nb - 1, block_stride, "plane address range"),
                   reach, "plane address range");
     } else {
@@ -274,9 +314,11 @@ PreparedGroup prepare_group(const PageBufferShapeDesc &shape_desc,
       checked_mul(separate ? 2 : 1, slab, "LMC object bytes");
   if (separate) {
     // 2LTD: K slab first, V slab after (planes[1] base = one full slab).
+    // 2LTD：K slab 在前，V slab 在后（planes[1] 基址偏移为一个完整 slab）。
     group.layout.planes[1].lmc_base_offset_bytes = slab;
   }
   // LMC pages must not share 32B lines.
+  // 不同 LMC 页不得共享同一个 32B 行。
   TORCH_CHECK(
       checked_mul(sd.bs, scalar_row, "LMC page bytes") % kGmAlignBytes == 0,
       "BS * LMC row bytes (", sd.bs * scalar_row, ") must be a multiple of ",
@@ -295,7 +337,9 @@ PreparedGroup prepare_group(const PageBufferShapeDesc &shape_desc,
 // ---------------------------------------------------------------------------
 // validate_launch: per-transfer dynamic variables.
 // ---------------------------------------------------------------------------
+// validate_launch：每次传输的动态变量。
 
+// 保存已通过校验的 launch 动态参数，供后续计算有效工作项和 block_ids 切片。
 struct CheckedLaunch {
   int32_t total_blocks = 0;
   int32_t num_objects = 0;
@@ -303,6 +347,8 @@ struct CheckedLaunch {
   int32_t skip_prefix_n_blocks = 0;
 };
 
+// 校验对象数量、每对象块数、block_ids 切片容量及 skip 前缀范围；skip 表示
+// 每个对象开头无需传输的块数，但不改变 block_ids 中逻辑块的位置。
 CheckedLaunch validate_launch(const PreparedGroup &group, int64_t total_blocks,
                               int num_objects, int64_t block_ids_offset,
                               int64_t block_ids_capacity,
@@ -323,6 +369,7 @@ CheckedLaunch validate_launch(const PreparedGroup &group, int64_t total_blocks,
               "skip_prefix_n_blocks (", skip_prefix_n_blocks,
               ") must be within [0, ", blocks, "]");
   // Subtraction form: offset + length itself may not overflow.
+  // 使用减法形式校验，避免 offset + length 本身发生溢出。
   TORCH_CHECK(block_ids_offset >= 0 && block_ids_offset <= block_ids_capacity,
               "block_ids_offset (", block_ids_offset, ") must be within [0, ",
               block_ids_capacity, "]");
@@ -345,7 +392,10 @@ CheckedLaunch validate_launch(const PreparedGroup &group, int64_t total_blocks,
 // ---------------------------------------------------------------------------
 // Launch: one kernel launch per object.
 // ---------------------------------------------------------------------------
+// Launch：每个对象启动一次 kernel。
 
+// 按“层、plane（可选）、有效块”计算工作项，并逐对象提交 kernel；skip 前缀
+// 由设备索引映射处理，launch 只覆盖实际需要搬运的块。
 void launch_prepared_objects(uint32_t aiv_num, void *stream,
                              const PreparedGroup &group,
                              uint8_t *paged_buffer_ptrs,
@@ -355,6 +405,8 @@ void launch_prepared_objects(uint32_t aiv_num, void *stream,
   // blockDim matches the ACTIVE work-item count (the kernel folds skip into
   // its index map). skip == blocks -> nothing to transfer; return early
   // because <<<0>>> would be an invalid launch.
+  // blockDim 与有效工作项数量匹配（kernel 将 skip 折叠进索引映射）。
+  // skip == blocks 时没有数据需要传输，因此提前返回，避免无效的 <<<0>>>。
   const int32_t plane_slots =
       group.separate_plane ? group.layout.num_planes : 1;
   const int64_t active_blocks =
@@ -381,11 +433,19 @@ void launch_prepared_objects(uint32_t aiv_num, void *stream,
 // ---------------------------------------------------------------------------
 // LMC object device-VA resolution and staging (direct entry).
 // ---------------------------------------------------------------------------
+// LMC 对象的设备虚拟地址解析与 staging（直接入口）。
 
 // CUDA UVA lets the kernel consume host data_ptr()s. Ascend DataCopy needs a
 // device VA: registered aclrtMallocHost (get_device_ptr) or a true NPU
 // allocation. MixedMemoryAllocator SHM L1 is neither — stage on-device and
 // aclrtMemcpy.
+// CUDA UVA 允许 kernel 直接使用 host data_ptr()；Ascend DataCopy 则需要设备
+// 虚拟地址：已注册 aclrtMallocHost 的映射地址（get_device_ptr）或真正的 NPU
+// 分配地址。MixedMemoryAllocator 的 SHM L1 两者都不是，需要先在设备侧
+// staging，再执行 aclrtMemcpy。
+// 普通 CPU 对象由调用方持有，需复制到 NPU staging；已注册锁页对象同样由
+// 调用方持有，但可直接使用其设备映射；NPU 对象直接使用原设备地址。未注册
+// 的锁页 host 指针也走 staging，三类外部对象的所有权都不会转移给本层。
 bool is_npu_memory_ptr(void *ptr) {
   aclrtPtrAttributes attributes{};
   const aclError ret = aclrtPointerGetAttributes(ptr, &attributes);
@@ -406,6 +466,9 @@ std::vector<int64_t> device_lmc_ptrs(const std::vector<int64_t> &ptrs) {
   return out;
 }
 
+// NPU staging 的拥有者：buf 持有设备分配，host_ptr 只是外部 host 对象的
+// 非拥有地址。stage 由 PreparedLmcPtrs 集中保存，异步生命周期遵循调用方的
+// stream 同步契约。
 struct HostStage {
   torch::Tensor buf;
   int64_t host_ptr = 0;
@@ -418,11 +481,19 @@ struct HostStage {
 // the kernel. Allocations happen BEFORE any enqueue; the caller's cache context
 // synchronizes the stream before releasing them, so the staging tensors stay
 // valid for the async copies.
+// 将 LMCache 对象指针解析为设备虚拟地址。既不是已注册 aclrtMallocHost、也不
+// 是 NPU 内存的 SHM/host 对象会获得设备侧 staging Tensor（HostStage），调用方
+// 在 kernel 前后安排异步 memcpy。所有分配都先于任何入队完成；调用方的 cache
+// context 在释放前同步 stream，从而保证 staging Tensor 对异步拷贝保持有效。
+// kernel_obj_ptrs 是供 kernel 使用的地址表，host_stages 则持有需要保活的
+// staging 资源；普通 CPU、锁页 host 与 NPU 外部对象仍由调用方负责释放。
 struct PreparedLmcPtrs {
   std::vector<int64_t> kernel_obj_ptrs;
   std::vector<HostStage> host_stages;
 };
 
+// 按“已注册锁页映射、NPU 原生地址、其他 host 地址”三类解析对象；仅第三类
+// 创建 staging，并统一返回 kernel 地址表和 staging 所有权容器。
 PreparedLmcPtrs prepare_lmc_ptrs(const std::vector<int64_t> &lmc_obj_ptrs,
                                  const torch::Device &device,
                                  const PreparedGroup &group) {
@@ -431,6 +502,7 @@ PreparedLmcPtrs prepare_lmc_ptrs(const std::vector<int64_t> &lmc_obj_ptrs,
   const auto staging_opts =
       torch::TensorOptions().dtype(torch::kUInt8).device(device);
   // One capacity formula for every layout.
+  // 所有布局共用同一个对象容量计算公式。
   const int64_t object_bytes = group.layout.lmc_object_bytes;
   TORCH_CHECK(object_bytes > 0, "LMCache object byte size must be positive");
   for (int64_t p : lmc_obj_ptrs) {
@@ -445,6 +517,7 @@ PreparedLmcPtrs prepare_lmc_ptrs(const std::vector<int64_t> &lmc_obj_ptrs,
       continue;
     }
     // A torch-pinned host pointer may not have a mapping in our registry.
+    // torch 锁页 host 指针可能并未在我们的注册表中建立映射。
     HostStage stage;
     stage.buf = torch::empty({object_bytes}, staging_opts);
     stage.host_ptr = p;
@@ -460,6 +533,11 @@ PreparedLmcPtrs prepare_lmc_ptrs(const std::vector<int64_t> &lmc_obj_ptrs,
 // before the kernel, D2H stages after, and a partial D2H store first reads
 // the host object into staging so the untouched prefix is preserved when
 // the whole object is written back.
+// 在 stream 上依次入队 HostStage memcpy 和 block kernel：H2D retrieve 在
+// kernel 前将 host 数据搬入 staging，D2H store 在 kernel 后写回 host；带 skip
+// 前缀的部分 D2H store 还会先读出完整 host 对象，确保整体写回时保留未触及
+// 的前缀。本函数只负责 native 入队，成功返回不表示传输完成；调用方必须同步
+// stream 后再访问结果或释放 host 对象与 staging 相关资源。
 int enqueue_block_transfer(void *stream, uint32_t aiv_num,
                            uint8_t *paged_buffer_ptrs,
                            const PreparedGroup &group,
@@ -497,6 +575,8 @@ int enqueue_block_transfer(void *stream, uint32_t aiv_num,
 
 } // namespace
 
+// 直接 native 入口：先完成静态/动态校验和 LMCache 地址准备，再在当前 NPU
+// stream 上提交 staging 与 kernel；H2D 为 retrieve，D2H 为 store。
 void multi_layer_block_kv_transfer(
     const torch::Tensor &paged_buffer_ptrs_tensor,
     std::vector<int64_t> lmcache_objects_ptrs, const torch::Tensor &block_ids,
@@ -504,8 +584,10 @@ void multi_layer_block_kv_transfer(
     PageBufferShapeDesc shape_desc, int lmcache_chunk_size,
     EngineKVFormat engine_kv_format, int skip_prefix_n_blocks) {
   // Device guard first: the UB query below needs the current device's SoC.
+  // 首先设置设备 guard：下面的 UB 查询需要当前设备的 SoC。
   const c10::OptionalDeviceGuard device_guard(device);
   // --- Static geometry (prepare_group) + dynamic variables (validate_launch)
+  // --- 静态几何（prepare_group）与动态变量（validate_launch）
   const PreparedGroup group =
       prepare_group(shape_desc, engine_kv_format, lmcache_chunk_size,
                     query_ub_budget_bytes());
@@ -530,6 +612,7 @@ void multi_layer_block_kv_transfer(
                 group.nl, ", got ", paged_buffer_ptrs_tensor.numel());
   } else {
     // Pointer table: one device pointer per (layer, physical plane).
+    // 指针表：每个（layer, physical plane）组合对应一个设备指针。
     const int64_t expected_ptrs =
         static_cast<int64_t>(group.layout.num_planes) * group.nl;
     TORCH_CHECK(paged_buffer_ptrs_tensor.numel() == expected_ptrs,
@@ -537,6 +620,8 @@ void multi_layer_block_kv_transfer(
                 "pointers: expected ",
                 expected_ptrs, ", got ", paged_buffer_ptrs_tensor.numel());
   }
+  // block_ids 是 NPU 上的 int64 逻辑块到引擎物理块映射，按对象连续分段；
+  // 本层不拥有该 Tensor，调用方须使其在 stream 同步完成前保持有效。
   TORCH_CHECK(block_ids.is_privateuseone(), "block_ids must live on the NPU");
   TORCH_CHECK(block_ids.scalar_type() == at::kLong,
               "block_ids must have dtype int64");
@@ -558,10 +643,16 @@ void multi_layer_block_kv_transfer(
   // be invoked in a loop (per-block fallback paths in callers); the first
   // call flushes the queue and the following ones find it empty, so the
   // repeated drain is a cheap empty-queue check.
+  // .stream() 在返回原始 stream 前排空 torch_npu 的 ACL 任务队列。按契约每次
+  // 调用都要排空：本次直接入队的操作必须排在上次排空后提交的 torch op 之后。
+  // 该操作可能被循环调用（调用方的逐 block 回退路径）；第一次调用刷新队列，
+  // 后续调用发现队列为空，因此重复排空只是一次低开销的空队列检查。
   aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
 
   // Direct launch (CUDA cudaLaunchKernel style): the kernel + staging memcpys
   // below are enqueued on the calling thread, no OpCommand / queue-thread hop.
+  // 直接启动（CUDA cudaLaunchKernel 风格）：下面的 kernel 和 staging memcpy
+  // 都在调用线程入队，不经过 OpCommand 或队列线程跳转。
   const char *socName = aclrtGetSocName();
   auto ascendcPlatform =
       platform_ascendc::PlatformAscendCManager::GetInstance(socName);
@@ -615,6 +706,9 @@ void lmcache_memcpy_async(uintptr_t dest, uintptr_t src, size_t nbytes,
                                  c10_npu::getCurrentNPUStream().stream());
 }
 
+// 执行对象组计划：先预校验全部 group、staging 和 launch，再按 BatchStep 顺序
+// 提交。H2D retrieve 先 host->临时 NPU 缓冲区再执行 kernel，D2H store 先执行
+// kernel 再写回 host；所有 native 操作均为异步入队，调用方负责最终同步。
 void execute_object_group_transfer(
     TransferDirection direction, const torch::Device &device,
     size_t host_buffer_alignment,
@@ -623,6 +717,8 @@ void execute_object_group_transfer(
   // Set the device guard once for the whole plan so every staging copy and
   // kernel launch below is enqueued on this device's current stream, in
   // order (mirrors upstream execute_object_group_transfer).
+  // 整个计划只设置一次设备 guard，使下面的 staging 拷贝和 kernel launch 按序
+  // 入队到该设备的当前 stream（与上游 execute_object_group_transfer 一致）。
   const c10::OptionalDeviceGuard device_guard(device);
   const bool is_h2d = (direction == TransferDirection::H2D);
   TORCH_CHECK(device.is_privateuseone(), "device must be an NPU device");
@@ -634,6 +730,8 @@ void execute_object_group_transfer(
   // --- Whole-plan pre-validation: every group is prepared and
   // every launch is validated before ANY staging copy or kernel launch is
   // enqueued. A failure here means "nothing started".
+  // --- 完整计划预校验：任何 staging 拷贝或 kernel launch 入队前，先准备所有
+  // group 并校验所有 launch。此处失败意味着“尚未开始任何操作”。
   const int64_t ub_bytes = query_ub_budget_bytes();
   std::vector<PreparedGroup> groups;
   groups.reserve(kernel_group_specs.size());
@@ -654,6 +752,8 @@ void execute_object_group_transfer(
       // Raw external pointers carry no derivable allocation capacity; the
       // plan builder owns pointer/size validity. What can be
       // checked cheaply here is checked.
+      // 原始外部指针无法推导分配容量，指针和大小的有效性由计划构建方负责；
+      // 此处只执行开销较低的检查。
       TORCH_CHECK(copy.nbytes > 0, "StagingCopy nbytes must be positive");
       TORCH_CHECK(copy.dest != 0 && copy.src != 0,
                   "StagingCopy pointers must be non-null");
@@ -695,6 +795,11 @@ void execute_object_group_transfer(
   // pointer table, block IDs, staging buffers and engine plane views are
   // owned by the caller's cache context, which synchronizes the stream before
   // releasing them, so the raw pointers below stay valid.
+  // 直接启动（CUDA cudaLaunchKernel 风格）：上面的 .stream() 先排空 torch_npu
+  // 的 ACL 任务队列，因此下面的 staging 拷贝和 kernel launch 都按 Python 调用
+  // 顺序入队，不经过队列线程。指针表、block_ids、staging 缓冲区和引擎 plane
+  // 视图均由调用方的 cache context 持有；它在释放前同步 stream，所以下面的
+  // 原始指针在异步执行期间保持有效。入队本身不是完成通知。
   const auto do_staging = [&](const std::vector<StagingCopy> &staging) {
     for (const auto &copy : staging) {
       lmcache_memcpy_async_on_stream(copy.dest, copy.src, copy.nbytes,
@@ -707,6 +812,9 @@ void execute_object_group_transfer(
     // H2D stages CPU->NPU temp buffers before the kernel reads them; D2H
     // stages NPU->CPU after the kernel writes them. The per-step ordering
     // must be preserved because temp buffers are reused across steps.
+    // H2D 在 kernel 读取前执行 CPU->NPU 临时缓冲区 staging；D2H 在 kernel
+    // 写入后执行 NPU->CPU staging。临时缓冲区会跨 step 复用，因此必须保持
+    // 每个 step 内的顺序。
     if (is_h2d) {
       do_staging(batch_steps[step_idx].staging);
     }

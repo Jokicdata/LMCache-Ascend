@@ -21,6 +21,7 @@
 
 namespace py = pybind11;
 
+// 将 Python 传入的单个 Tensor 或 Tensor 元组统一转换为 C++ Tensor 向量。
 std::vector<torch::Tensor> normalize_kv_caches(const py::object &input) {
   if (THPVariable_Check(input.ptr())) {
     return {input.cast<torch::Tensor>()};
@@ -83,6 +84,8 @@ void batched_fused_single_layer_kv_transfer_wrapper(
       vllm_two_major);
 }
 
+// Python 到 C++ 的绑定层：把 Python 对象、枚举值和参数列表映射为 native 类型，
+// 再分派到对应 C++ 实现；此处只适配跨语言接口，不改变传输语义。
 PYBIND11_MODULE(c_ops, m) {
   m.def("get_device_ptr", [](uintptr_t ptr_addr) {
     return reinterpret_cast<uintptr_t>(
@@ -132,6 +135,8 @@ PYBIND11_MODULE(c_ops, m) {
         py::call_guard<py::gil_scoped_release>());
   // Return each payload as py::bytes; pybind11 utf-8-decodes std::string
   // by default, corrupting binary payloads (e.g. msgpack).
+  // 将每个 payload 作为 py::bytes 返回；pybind11 默认按 UTF-8 解码
+  // std::string，会破坏二进制 payload（例如 msgpack）。
   m.def("drain_recorded_completions", []() {
     auto items = drain_recorded_completions();
     py::list out;
@@ -141,6 +146,8 @@ PYBIND11_MODULE(c_ops, m) {
     return out;
   });
 
+  // Python 与 C++ 共用方向枚举值：H2D 表示从 LMCache 取回 KV 到引擎（retrieve），
+  // D2H 表示从引擎写回 KV 到 LMCache（store）。
   py::enum_<TransferDirection>(m, "TransferDirection", py::module_local())
       .value("H2D", TransferDirection::H2D)
       .value("D2H", TransferDirection::D2H)
@@ -168,11 +175,17 @@ PYBIND11_MODULE(c_ops, m) {
       .export_values();
   // Match upstream lmcache_native / CUDA pybind: tests and connectors use
   // GPUKVFormat as an alias of EngineKVFormat.
+  // 与上游 lmcache_native / CUDA pybind 保持一致：测试和连接器将
+  // GPUKVFormat 用作 EngineKVFormat 的别名。
   m.attr("GPUKVFormat") = m.attr("EngineKVFormat");
   // Factory constructs this class via device_ops.PageBufferShapeDesc()
   // after NpuDeviceOps.bind_native. Kernels take it by value (same as CUDA
   // + lmcache_native). dynamic_attr keeps torch dtype for the Python
   // torch_ops fallback.
+  // 工厂在 NpuDeviceOps.bind_native 之后通过
+  // device_ops.PageBufferShapeDesc() 构造该类。kernel 按值接收它（与 CUDA
+  // 和 lmcache_native 相同）；dynamic_attr 为 Python torch_ops 回退路径
+  // 保留 torch dtype。
   py::class_<PageBufferShapeDesc>(m, "PageBufferShapeDesc", py::module_local(),
                                   py::dynamic_attr())
       .def(py::init<>())
@@ -220,6 +233,13 @@ PYBIND11_MODULE(c_ops, m) {
         // enqueues kernels + memcpys. A c10::Error from TORCH_CHECK
         // re-acquires the GIL during unwinding, so failures still surface as
         // Python exceptions (mp worker threads keep a clean error contract).
+        // 直接启动路径：传输先排空 torch_npu 的 ACL 任务队列
+        // （getCurrentNPUStream().stream()），再将 kernel 和 memcpy 入队，
+        // 此期间释放 GIL。TORCH_CHECK 抛出的 c10::Error 会在栈展开时重新
+        // 获取 GIL，因此失败仍会表现为 Python 异常（MP worker 线程保持
+        // 一致的错误契约）。
+        // native 入队成功不等于传输完成；Python 调用方必须同步对应 stream，
+        // 之后才能读取结果或释放、复用相关缓冲区。
         py::gil_scoped_release release;
         multi_layer_block_kv_transfer(
             paged_buffer_ptrs_tensor, std::move(lmcache_objects_ptrs),
@@ -288,6 +308,11 @@ PYBIND11_MODULE(c_ops, m) {
       // enqueued on the calling thread after draining torch_npu's ACL task
       // queue (getCurrentNPUStream().stream()), so the GIL can be released
       // for the whole enqueue.
+      // 直接启动路径（与 CUDA 一致）：排空 torch_npu 的 ACL 任务队列
+      // （getCurrentNPUStream().stream()）后，所有 kernel 和 memcpy 都在
+      // 调用线程入队，因此整个入队期间均可释放 GIL。
+      // 该绑定返回仅表示执行计划已提交，不表示异步操作已完成；调用方需负责
+      // stream 同步以及相关指针表、block_ids 和 staging 缓冲区的生命周期。
       py::call_guard<py::gil_scoped_release>());
   m.def("lmcache_memcpy_async", &lmcache_memcpy_async,
         py::call_guard<py::gil_scoped_release>());

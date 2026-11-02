@@ -35,6 +35,10 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         role: KVConnectorRole,
         parent: KVConnectorBase_V1,
     ):
+        """中文导读：输入为 vLLM 配置、生产者/消费者角色及外层连接器，
+        无显式返回值。调用方向为动态连接器 → 本实现构造 → 上游初始化；
+        随后补齐异步 store 状态，用于协调 wait_for_save、get_finished 与请求释放。
+        """
         logger.debug("Initializing LMCacheAscendConnectorV1Impl")
         super().__init__(vllm_config, role, parent)
         self.store_async = self.config.store_async
@@ -67,6 +71,11 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
 
     @_lmcache_nvtx_annotate
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
+        """中文导读：输入为当前前向上下文及可选加载参数，无显式返回值。
+        调用方向为 vLLM 前向开始前 → 本入口 → 上游 ``start_load_kv``，
+        由引擎 ``retrieve`` 和 NPU connector 将 CPU/远端 KV 装入分页显存；
+        随后把 P2P 加载失败的块标为需本地重算，并重置本轮保存完成状态。
+        """
         self.current_layer = 0
         self._wait_for_save_done = False
         super().start_load_kv(forward_context, **kwargs)
@@ -122,7 +131,14 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
 
     @_lmcache_nvtx_annotate
     def wait_for_save(self):
-        """Blocking until the KV cache is saved to the connector buffer."""
+        """Blocking until the KV cache is saved to the connector buffer.
+
+        中文导读：无显式输入和返回值，从父连接器读取本轮请求元数据。
+        调用方向为 vLLM 前向结束后 → 本函数 → ``lookup_unpin`` 释放查询固定，
+        再按角色推进逐层保存或调用引擎 ``store``；数据方向为 NPU 分页 KV →
+        connector ``batched_from_gpu`` → 已分配的 CPU 内存对象 → 存储后端。
+        异步模式只负责把保存任务排队，完成状态交由 ``get_finished`` 查询。
+        """
 
         connector_metadata = self._parent._get_connector_metadata()
         assert isinstance(connector_metadata, LMCacheConnectorMetadata)
@@ -140,6 +156,10 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         # store nor look up locally. The base store() already no-ops for them,
         # and _local_persist_skip's local lookup would assert on the missing
         # storage_manager. Short-circuit the whole save path for these ranks.
+        # 中文：在 save_only_first_rank（MLA/DSA 默认）下，仅首 rank 持有
+        # storage_manager；其他“被动”rank 不在本地 store 或 lookup。
+        # 上游 store() 对它们已是空操作，而 _local_persist_skip 的本地查询
+        # 会因缺少 storage_manager 触发断言，所以这里直接跳过整条保存路径。
         if self.lmcache_engine is not None and self.lmcache_engine._is_passive():
             for request in connector_metadata.requests:
                 self.lmcache_engine.lookup_unpin(request.req_id)
@@ -189,6 +209,10 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 # Re-derive how many leading tokens are *already local* and, if
                 # a remote-loaded prefix is missing locally, persist it into the
                 # local backend so later hits stay local.
+                # 中文：save_spec.skip_leading_tokens 来自本地与远端的总命中数。
+                # 若命中前缀取自远端，本地 CPU 后端仍没有这些块；这里全部跳过会让
+                # 后续请求反复从远端拉取。因此重新计算已在本地的前缀长度，并把本地
+                # 缺失的远端前缀回填到本地后端，使后续命中可直接使用本地缓存。
                 persist_remote_skip = self._local_persist_skip(request, token_ids)
                 # lmcache-ascend end ----------------------------------------
 
@@ -273,6 +297,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                         request.disagg_spec.num_transferred_tokens = len(token_ids)
             except Exception:
                 # Do not let one failing request abort the save loop
+                # 中文：单个请求保存失败时记录异常并继续，不中断整个保存循环。
                 logger.exception(
                     "wait_for_save failed for request %s; skipping save",
                     request.req_id,
@@ -359,6 +384,12 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[Optional[set[str]], Optional[set[str]]]:
+        """中文导读：输入为调度器已结束生成的请求 ID 集合，返回
+        ``(finished_sending, finished_recving)``；本实现只上报发送/保存完成集合，
+        接收方向固定为 ``None``。调用方向为 vLLM 查询完成状态 → 本函数 →
+        引擎 ``get_finished_stores``；仍在等待或执行异步 store 的请求会延后上报，
+        避免其 NPU 块在保存读取完成前被释放。
+        """
         if self.lmcache_engine is None:
             return None, None
         query_req_ids = set(finished_req_ids)
@@ -366,6 +397,8 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             # NOTE (gingfung): The is a workaround logic for the case
             # where the requests is deferred (i.e. spec_decode or MTP)
             # and the model_runner call get_finished before wait_for_save.
+            # 中文：这是针对延迟请求（如 spec_decode 或 MTP）的规避逻辑；
+            # 此时 model_runner 可能先于 wait_for_save 调用 get_finished。
             connector_metadata = self._parent._get_connector_metadata()
             assert isinstance(connector_metadata, LMCacheConnectorMetadata)
 
@@ -417,6 +450,12 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         request: "Request",
         block_ids: list[int],
     ) -> tuple[bool, Optional[dict[str, Any]]]:
+        """中文导读：输入为已结束的 vLLM 请求及其 KV 块 ID，返回
+        ``(delay_free, return_params)``。调用方向为 vLLM 请求收尾 → 本函数 →
+        上游收尾逻辑；中止请求会额外 ``lookup_unpin`` 并等待未完成的异步 store。
+        异步非消费者通过 ``delay_free`` 延后释放 KV 块，直到 ``get_finished``
+        确认保存结束；``return_params`` 可携带需要回传的 chunk hashes。
+        """
         _, return_params = super().request_finished(request, block_ids)
 
         # chunk_hashes return start ---------------------

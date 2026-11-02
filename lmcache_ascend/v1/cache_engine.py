@@ -130,6 +130,11 @@ class AscendLMCacheEngine(LMCacheEngine):
         self._store_worker_thread.start()
 
     def post_init(self, **kwargs) -> None:
+        """中文导读：输入为上游初始化所需参数（通常含 ``kvcaches``），无显式返回值。
+        调用方向为 vLLM/SGLang 连接器构造 → 本函数 → 上游 ``post_init``；
+        随后按配置启动异步 store 工作线程，并准备首 rank 广播所需的 NPU stream。
+        这里只完成运行期资源接线，实际读写仍由 retrieve/store 入口发起。
+        """
         super().post_init(**kwargs)
         if self.is_store_async:
             self._device_id = torch.npu.current_device()
@@ -143,6 +148,8 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         # Override upstream broadcast_stream with a dedicated NPU stream
         # so broadcast and to_gpu can execute on separate streams.
+        # 中文：用独立 NPU stream 覆盖上游 broadcast_stream，
+        # 使广播和 to_gpu 能在不同 stream 上执行。
         if self.save_only_first_rank:
             if not hasattr(self.gpu_connector, "load_stream"):
                 raise RuntimeError(
@@ -151,6 +158,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 )
             # Auto-estimate or validate shard_size now that model weights
             # are loaded and NPU memory state is stable.
+            # 中文：模型权重已加载且 NPU 显存状态稳定后，自动估算或校验分片大小。
             if self._broadcast_shard_size is None:
                 self._broadcast_shard_size = self._estimate_shard_size()
             else:
@@ -620,8 +628,16 @@ class AscendLMCacheEngine(LMCacheEngine):
             length as *tokens*. On CPU.
         :raises ValueError: If the number of Falses in the mask is not a
             multiple of the chunk size.
+
+        中文导读：输入为待取回的 token、匹配掩码及 KV 池/槽位等 ``kwargs``，
+        返回与 token 等长的 CPU 布尔张量，标记哪些 token 已成功取回。
+        调用方向为连接器 load/start_load_kv → 本函数 → token 处理与存储查询 →
+        NPU connector；数据方向为 CPU/远端缓存内存对象 → ``batched_to_gpu`` →
+        NPU 分页 KV。取回完成后按所有权调用 ``ref_count_down`` 释放读引用，
+        首 rank 分片广播已接管的对象不能在这里重复释放。
         """
         # Health check: block operation if LMCache is unhealthy
+        # 中文：健康检查；LMCache 状态异常时跳过 retrieve。
         if not self.is_healthy():
             logger.warning("LMCache is unhealthy, skipping retrieve operation")
             return torch.zeros(len(tokens), dtype=torch.bool)
@@ -631,6 +647,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
 
         # Get req_id for logging
+        # 中文：取得 req_id，供日志关联本次请求。
         req_id = self._get_req_id(kwargs)
 
         tot_kv_size = 0
@@ -641,6 +658,7 @@ class AscendLMCacheEngine(LMCacheEngine):
             num_required_tokens = len(tokens)
 
         # KVCache Check logging
+        # 中文：记录本次 KV 缓存操作，供运行检查与诊断。
         self._log_kvcache_for_check(
             operation="retrieve",
             kwargs=kwargs,
@@ -676,6 +694,9 @@ class AscendLMCacheEngine(LMCacheEngine):
         # Rank 0's to_gpu reuses the NPU tensors produced by the broadcast
         # and non-rank-0's runs on the broadcast receive buffers, avoiding
         # a second CPU->NPU PCIe transfer.
+        # 中文：分片广播流水线内部同时完成 broadcast 和 to_gpu，因此各 rank
+        # 不再执行下面的 batched_to_gpu。rank 0 复用广播产生的 NPU 张量，
+        # 非 rank 0 在广播接收缓冲上执行 to_gpu，避免第二次 CPU→NPU PCIe 传输。
         if self.save_only_first_rank:
             with retrieve_stats.profile_broadcast():
                 self._pipelined_sharded_broadcast_and_load(
@@ -693,6 +714,9 @@ class AscendLMCacheEngine(LMCacheEngine):
         # takes ownership of the sender's CPU mem_objs (it releases them in
         # its finally block after the H2D copies complete).  So we skip the
         # ref_count_down here for the sender to avoid double-free.
+        # 中文：清理读引用。save_only_first_rank 下，分片广播流水线接管发送端
+        # CPU mem_objs，并在 H2D 完成后的 finally 中释放；因此发送端这里跳过
+        # ref_count_down，避免重复释放，其余路径仍按引用计数正常回收。
         skip_refcnt = self.save_only_first_rank and self.metadata.is_first_rank()
         for key, memory_obj, _, _ in reordered_chunks:
             if self.remove_after_retrieve and not self._is_passive():
@@ -726,6 +750,11 @@ class AscendLMCacheEngine(LMCacheEngine):
         return ret_mask
 
     def _store_worker_loop(self) -> None:
+        """中文导读：无参数、无显式返回值，是异步 store 的后台消费者循环。
+        调用方向为 ``post_init``/``store`` 启动线程 → 本循环 → 从队列取任务 →
+        ``_run_store_pipeline``；每个任务结束后递减该请求的 in-flight 计数并
+        通知等待者，使 ``get_finished_stores`` 能判断何时允许释放请求 KV 块。
+        """
         if not self.is_store_async:
             return
         if self._device_id is not None:
@@ -733,6 +762,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         while True:
             work = self._store_queue.get()
             if work is None:  # poison pill
+                # 中文：None 是停止后台循环的“毒丸”信号。
                 self._store_queue.task_done()
                 break
 
@@ -779,12 +809,21 @@ class AscendLMCacheEngine(LMCacheEngine):
     ) -> None:
         """Shared implementation for sync and async store.
         From upstream store function.
+
+        中文导读：输入为请求 ID、token 或预计算哈希、分块偏移、掩码、待存数量
+        及 KV 传输参数，无显式返回值；同步由 ``store`` 直接调用，异步由后台
+        ``_store_worker_loop`` 调用。流程先用 ``process_tokens`` 生成键和范围，
+        再通过 ``storage_manager.allocate`` 分配 CPU ``memory_objs``；
+        数据经 ``batched_from_gpu`` 按 NPU 分页 KV → CPU 内存对象方向写入，
+        最后由 ``batched_put`` 提交后端并接管引用计数。若提交前失败，本函数
+        逐个 ``ref_count_down``，避免已分配对象泄漏。
         """
         assert tokens is not None or hashes is not None, (
             "Either 'tokens' or 'hashes' must be provided."
         )
 
         # KVCache Check logging
+        # 中文：记录本次 KV 缓存操作，供运行检查与诊断。
         self._log_kvcache_for_check(
             operation="Store",
             kwargs=kwargs,
@@ -793,6 +832,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
 
         # Check if freeze mode is enabled
+        # 中文：检查是否处于冻结模式；冻结时跳过保存。
         if self.is_frozen():
             logger.debug(
                 "Freeze mode enabled, skipping store operation for %d tokens",
@@ -825,11 +865,13 @@ class AscendLMCacheEngine(LMCacheEngine):
             ):
                 assert isinstance(key, CacheEngineKey)
                 # Allocate the memory object
+                # 中文：为当前分块分配 CPU 内存对象，作为 NPU→CPU 保存传输的目标。
                 num_tokens = end - start
                 kv_shapes = self.metadata.get_shapes(num_tokens)
                 kv_dtypes = self.metadata.get_dtypes()
 
                 # TODO (Jiayi): should be batched in the future
+                # 中文：待优化项——未来应将这里的逐个分配改为批量分配。
                 memory_obj = self.storage_manager.allocate(
                     kv_shapes,
                     kv_dtypes,
@@ -855,6 +897,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 tot_token_num += num_tokens
 
                 # Create KV event
+                # 中文：如启用事件上报，为当前缓存块创建 KV 保存事件。
                 if self.kv_events_enabled:
                     stored_event = CacheStoreEvent(
                         block_hashes=[key.chunk_hash],
@@ -885,6 +928,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                     prev_key = key.chunk_hash
 
         # memory_objs might be empty, directly return to avoid sending tokens
+        # 中文：memory_objs 可能为空；此时直接返回，避免提交空传输和空写入。
         if not memory_objs:
             return
 
@@ -900,6 +944,8 @@ class AscendLMCacheEngine(LMCacheEngine):
                     transfer_spec = kwargs.get("transfer_spec", None)
                     # TODO: we implicitly rely on batched_put to call ref_count_down
                     # this management should be done in a cleaner way
+                    # 中文：这里依赖 batched_put 在接管对象后调用 ref_count_down；
+                    # 所以成功提交后不能再次释放，未来应以更清晰的方式管理所有权。
                     self.storage_manager.batched_put(
                         keys,
                         memory_objs,
@@ -925,6 +971,9 @@ class AscendLMCacheEngine(LMCacheEngine):
         # copy time. Report the breakdown explicitly to avoid misleading
         # "offload_time" semantics; a dedicated device-copy metric should be
         # added at the connector layer (see Issue #233 fix plan).
+        # 中文：自 PR #221 引入 slot_mapping/排序异步复制后，from_gpu_time
+        # 包含 wait_for_forward 等待，并非纯设备复制耗时。日志明确拆分各项，
+        # 避免误解 offload_time；后续应在 connector 层增加独立复制指标。
         logger.info(
             "[req_id=%s] Stored %d out of total %d tokens. "
             "size: %.4f GB, cost %.4f ms, throughput: %.4f GB/s; "
@@ -944,12 +993,20 @@ class AscendLMCacheEngine(LMCacheEngine):
         )
 
     def get_finished_stores(self, finished_req_ids: set) -> set:
+        """中文导读：输入为生成已结束、等待确认保存状态的请求 ID 集合，
+        返回本轮可安全上报为 finished_sending 的 ID 集合；同步模式返回 ``None``。
+        调用方向为 vLLM ``get_finished`` → 本函数；仍存在于
+        ``_pending_store_reqs`` 的请求继续延后，后台保存计数清零后才可上报，
+        并通过去重避免调度器重复释放同一请求的块。
+        """
         if not self.is_store_async:
             return None
         result: set = set()
         with self._store_lock:
             # Forget req_ids the scheduler no longer asks about.
             # This bounds the set to at most |finished_req_ids|.
+            # 中文：移除调度器不再询问的 req_id，使已上报集合的规模不超过
+            # 当前 finished_req_ids 的大小。
             self._reported_finished_store_ids &= finished_req_ids
 
             for req_id in list(self._deferred_finished_req_ids):
@@ -962,6 +1019,8 @@ class AscendLMCacheEngine(LMCacheEngine):
                     # Already reported — skip to avoid scheduler seeing
                     # a duplicate finished_sending for blocks it has
                     # already freed.
+                    # 中文：已经上报过的请求直接跳过，避免调度器对其已释放的块
+                    # 再收到一次重复的 finished_sending。
                     continue
                 if req_id in self._pending_store_reqs:
                     self._deferred_finished_req_ids.add(req_id)
@@ -1036,7 +1095,14 @@ class AscendLMCacheEngine(LMCacheEngine):
         pin: bool = False,
         request_configs: Optional[dict] = None,
     ) -> int:
+        """中文导读：输入为 token 或哈希/偏移、查询后端范围、lookup_id 和 pin
+        选项，返回连续命中的 token 数；不直接搬运 KV。
+        调用方向为连接器加载前查询 → 本函数 → 上游 ``lookup``；``pin=True``
+        会为 lookup_id 固定命中对象，供后续 retrieve 使用，完成后必须调用
+        ``lookup_unpin``。引擎锁用于与异步 store 的状态变更互斥。
+        """
         # Serialize against the store-worker thread's
+        # 中文：通过引擎状态锁与 store 后台线程串行化相关状态操作。
         with self._engine_state_lock:
             return super().lookup(
                 tokens=tokens,
@@ -1049,6 +1115,11 @@ class AscendLMCacheEngine(LMCacheEngine):
             )
 
     def lookup_unpin(self, lookup_id: str) -> None:
+        """中文导读：输入为此前 ``lookup(pin=True)`` 使用的标识，无显式返回值。
+        调用方向为请求加载/保存收尾或中止 → 本函数 → 上游 ``lookup_unpin``，
+        释放该请求的查询固定引用；它与 retrieve 后的 ``ref_count_down`` 不同，
+        前者解除 lookup 固定，后者归还具体内存对象的引用。
+        """
         with self._engine_state_lock:
             super().lookup_unpin(lookup_id)
 
@@ -1079,8 +1150,16 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         :raises: ValueError if the number of Falses in the mask is not a
             multiple of the chunk size.
+
+        中文导读：输入为待保存的 token 或哈希/偏移、保存掩码及 KV 池/槽位等
+        ``kwargs``，无显式返回值。调用方向为连接器 wait_for_save/store_kv →
+        本函数 → ``_run_store_pipeline``；数据方向始终是 NPU 分页 KV →
+        ``batched_from_gpu`` → ``allocate`` 得到的 CPU 内存对象 →
+        ``batched_put`` 存储后端。同步模式直接执行，异步模式只排队并登记
+        in-flight 计数，由后台线程完成保存。
         """
         # Health check: block operation if LMCache is unhealthy
+        # 中文：健康检查；LMCache 状态异常时跳过 store。
         if not self.is_healthy():
             logger.warning("LMCache is unhealthy, skipping store operation")
             return
@@ -1096,9 +1175,11 @@ class AscendLMCacheEngine(LMCacheEngine):
         assert self.storage_manager is not None
 
         # Get req_id for logging
+        # 中文：取得 req_id，供保存日志和异步任务跟踪使用。
         req_id = self._get_req_id(kwargs)
 
         # Initialize num_to_store_tokens to avoid reference before assignment
+        # 中文：先初始化待保存 token 数，避免后续引用尚未赋值的变量。
         num_to_store_tokens = 0
 
         if mask is not None:

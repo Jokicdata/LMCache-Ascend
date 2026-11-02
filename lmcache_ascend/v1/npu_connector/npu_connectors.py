@@ -211,11 +211,20 @@ class VLLMBufferLayerwiseNPUConnector(VLLMBufferLayerwiseGPUConnector):
 
         :param ends: The ending indices of the KV cache in the corresponding
             token sequence.
+
+        中文导读：输入 ``starts``/``ends`` 指定各缓存块在 token 序列中的范围，
+        ``kwargs`` 提供 kvcaches 和 slot_mapping；输出为逐层生成器，调用方通过
+        ``yield`` 传入每层的 memory_objs，并推进 num_layers + 2 次。
+        调用方向为引擎 retrieve_layer → 本生成器；数据方向为 CPU 内存对象 →
+        NPU 双缓冲 → NPU 分页 KV。开头经辅助函数调用继承的
+        ``initialize_kvcaches_ptr`` 接收缓存指针，结束时对临时缓冲
+        ``ref_count_down``。
         """
         slot_mapping = self._prepare_transfer_context(kwargs)
 
         if self.fused_rotary_emb is None and self.cache_positions:
             # TODO(Jiayi): Make this more elegant
+            # 中文：待优化项——用更清晰的方式获取融合旋转位置编码实现。
             self.lmc_model = LMCBlenderBuilder.get(ENGINE_NAME).layerwise_model
             self.fused_rotary_emb = self.lmc_model.fused_rotary_emb
 
@@ -224,6 +233,7 @@ class VLLMBufferLayerwiseNPUConnector(VLLMBufferLayerwiseGPUConnector):
         )
 
         # compute gap positions
+        # 中文：计算各有效缓存块之间的空洞位置，后续将这些位置清零。
         gap_mask = torch.ones(
             num_all_tokens, dtype=torch.bool, device=slot_mapping_full.device
         )
@@ -256,6 +266,7 @@ class VLLMBufferLayerwiseNPUConnector(VLLMBufferLayerwiseGPUConnector):
                     False,
                     self.kv_format.value,
                     False,  # shape is [2, num_tokens, hidden_dim]
+                    # 中文：上一参数对应的数据形状为 [2, num_tokens, hidden_dim]。
                     self.vllm_two_major,
                 )
                 del self.buffer_mapping[layer_id - 2]
@@ -267,9 +278,11 @@ class VLLMBufferLayerwiseNPUConnector(VLLMBufferLayerwiseGPUConnector):
 
             if layer_id > 0 and layer_id <= self.num_layers:
                 # NOTE: wait until both compute and load streams are done
+                # 中文：等待计算流和加载流均完成，再复用缓冲区。
                 torch.cuda.synchronize()
 
                 # ping-pong the buffers
+                # 中文：交换计算与加载缓冲，形成双缓冲流水线。
                 compute_gpu_buffer_obj, load_gpu_buffer_obj = (
                     load_gpu_buffer_obj,
                     compute_gpu_buffer_obj,
@@ -285,6 +298,7 @@ class VLLMBufferLayerwiseNPUConnector(VLLMBufferLayerwiseGPUConnector):
                     )
 
                 # gap zeroing after RoPE
+                # 中文：在 RoPE 处理后把无效空洞位置清零。
                 if self.current_gap_positions.numel():
                     compute_gpu_buffer_obj.tensor[:, self.current_gap_positions] = 0.0
 
@@ -296,6 +310,7 @@ class VLLMBufferLayerwiseNPUConnector(VLLMBufferLayerwiseGPUConnector):
                 memory_objs_layer = yield
 
                 # memobj -> gpu_buffer
+                # 中文：将本层各内存对象的 KV 从 CPU 复制到 NPU 加载缓冲。
                 with torch.cuda.stream(self.load_stream):
                     for start, end, memory_obj in zip(
                         starts, ends, memory_objs_layer, strict=False
@@ -319,6 +334,7 @@ class VLLMBufferLayerwiseNPUConnector(VLLMBufferLayerwiseGPUConnector):
                 yield
 
         # free the buffer memory
+        # 中文：通过 ref_count_down 归还临时 NPU 缓冲的引用。
         load_gpu_buffer_obj.ref_count_down()
         compute_gpu_buffer_obj.ref_count_down()
 
@@ -331,6 +347,7 @@ class VLLMBufferLayerwiseNPUConnector(VLLMBufferLayerwiseGPUConnector):
 
     # TODO(Jiayi): Reduce repetitive operations in `batched_to_gpu`
     # and `batched_from_gpu`.
+    # 中文：待优化项——减少 batched_to_gpu 与 batched_from_gpu 的重复操作。
     @_lmcache_nvtx_annotate
     def batched_from_gpu(
         self,
@@ -363,6 +380,12 @@ class VLLMBufferLayerwiseNPUConnector(VLLMBufferLayerwiseGPUConnector):
         :raises ValueError: If 'kvcaches' is not provided in kwargs.
 
         :raises ValueError: If 'slot_mapping' is not provided in kwargs.
+
+        中文导读：输入为按层组织的 CPU ``memory_objs``、各块 token 范围及
+        kvcaches/slot_mapping 参数，输出为逐层生成器，共推进 num_layers + 1 次。
+        调用方向为逐层 wait_for_save/store_kv → 本生成器；数据方向为
+        NPU 分页 KV → NPU 临时缓冲 → CPU 内存对象，随后由引擎 ``batched_put``
+        写入后端。临时缓冲用完通过 ``ref_count_down`` 归还。
         """
         slot_mapping = self._prepare_transfer_context(kwargs)
 
@@ -389,6 +412,7 @@ class VLLMBufferLayerwiseNPUConnector(VLLMBufferLayerwiseGPUConnector):
         for layer_id in range(self.num_layers):
             memory_objs_layer = memory_objs[layer_id]
             # kvcaches -> gpu_buffer -> memobj
+            # 中文：保存方向为 NPU 分页 KV → NPU 缓冲 → CPU 内存对象。
             with torch.cuda.stream(self.store_stream):
                 self.store_stream.wait_stream(current_stream)
 
@@ -399,6 +423,7 @@ class VLLMBufferLayerwiseNPUConnector(VLLMBufferLayerwiseGPUConnector):
                     True,
                     self.kv_format.value,
                     False,  # shape is [2, num_tokens, hidden_dim]
+                    # 中文：上一参数对应的数据形状为 [2, num_tokens, hidden_dim]。
                     self.vllm_two_major,
                 )
 
@@ -425,6 +450,7 @@ class VLLMBufferLayerwiseNPUConnector(VLLMBufferLayerwiseGPUConnector):
             logger.debug("Finished offloading layer %s", layer_id)
 
         # free the buffer memory
+        # 中文：通过 ref_count_down 归还临时 NPU 缓冲的引用。
         tmp_gpu_buffer_obj.ref_count_down()
         yield
 
@@ -505,6 +531,12 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         )
 
     def _initialize_pointers(self, kv_caches: List[torch.Tensor]) -> torch.Tensor:
+        """中文导读：输入为各层 NPU KV 张量（可为分离、合并、MLA 或 DSA 布局），
+        返回按设备缓存的 NPU int64 指针张量，供自定义传输内核寻址。
+        调用方向为 ``to_gpu``/``from_gpu`` → 本函数；继承的
+        ``initialize_kvcaches_ptr`` 先接收 ``kwargs`` 中的 kvcaches，本函数再识别
+        格式、收集 data_ptr 并推导 page_buffer_size 等布局参数，不搬运 KV 数据。
+        """
         self.kv_format = KVCacheFormat.detect(kv_caches, use_mla=self.use_mla)
 
         if self.kv_format == KVCacheFormat.UNDEFINED:
@@ -595,6 +627,8 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
                 # kv_caches[0]: [tuple(k,v)]
                 # 310P: [num_blocks, num_kv_heads * head_size // 16, block_size, 16]
                 # 910B: [num_blocks, block_size, num_kv_heads, head_size]
+                # 中文：kv_caches[0] 是 (K, V) 元组；310P 与 910B 的每层形状
+                # 分别如上述英文所示，据此推导 block_size 和 page_buffer_size。
                 assert first_tensor.dim() >= 2
                 if is_310p():
                     self.block_size = first_tensor.shape[-2]
@@ -608,6 +642,8 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
                 # kv_caches[0].shape: [2, num_pages, page_size, num_heads, head_size]
                 # 310P: [2, num_blocks, num_kv_heads * head_size // 16, block_size, 16]
                 # 910B: [2, num_blocks, block_size, num_kv_heads, head_size]
+                # 中文：合并 KV 的通用、310P、910B 形状依次如上述英文所示，
+                # 不同布局下 page_buffer_size 的维度取法也不同。
                 assert first_tensor.dim() == 5
                 if is_310p():
                     self.block_size = first_tensor.shape[-2]
@@ -761,6 +797,12 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         :raises ValueError: If 'kvcaches' is not provided in kwargs.
         :raises AssertionError: If the memory object does not have a tensor.
         :raises ValueError: If 'slot_mapping' is not provided in kwargs.
+
+        中文导读：输入为单个 CPU/代理内存对象、token 区间 ``[start, end)`` 及
+        kvcaches/full slot_mapping，无显式返回值。调用方向为
+        ``batched_to_gpu`` → 本函数 → ``initialize_kvcaches_ptr`` 和
+        ``_initialize_pointers`` → NPU 传输内核；数据方向为内存对象 →
+        NPU 分页 KV 的指定槽位，供 retrieve 后的 attention 读取。
         """
         assert memory_obj.tensor is not None
 
@@ -820,6 +862,12 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         :raises ValueError: If 'kvcaches' is not provided in kwargs,
         :raises AssertionError: If the memory object does not have a tensor.
         :raises ValueError: If 'slot_mapping' is not provided in kwargs.
+
+        中文导读：输入为 ``allocate`` 得到的目标内存对象、token 区间及
+        kvcaches/slot_mapping，无显式返回值，但会填充对象并在 MLA 下更新格式。
+        调用方向为 ``batched_from_gpu`` → 本函数 → 指针初始化 → NPU 传输内核；
+        数据方向为 NPU 分页 KV → 可选 NPU staging 缓冲 → CPU ``memory_obj``，
+        是 store 保存链的一部分，不是加载。
         """
         assert memory_obj.tensor is not None
 
@@ -837,6 +885,7 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
             if not isinstance(slot_mapping, torch.Tensor):
                 raise ValueError("'slot_mapping' should be a torch.Tensor.")
             # for Ascend kernels to keep test inputs backward compatible.
+            # 中文：为兼容既有测试输入，非 NPU 的 slot_mapping 会先搬到 NPU。
             if slot_mapping.device.type != "npu":
                 with torch.npu.stream(self.store_stream):
                     slot_mapping = slot_mapping.to(
@@ -857,6 +906,7 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
 
         with torch.npu.stream(self.store_stream):
             # No staging buffer or token count mismatch
+            # 中文：没有 staging 缓冲或 token 数不匹配时，直接卸载到内存对象。
             if self.gpu_buffer is None or end - start != self.gpu_buffer.shape[2]:
                 lmc_ops.multi_layer_kv_transfer(
                     memory_obj.tensor,
@@ -874,6 +924,8 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
             else:
                 assert self.gpu_buffer.device == self.kvcaches_device
                 tmp_gpu_buffer = self.gpu_buffer[:, :, : end - start, :]
+                # 中文：下列调用以分页 KV 为源、CPU memory_obj 为目标，
+                # tmp_gpu_buffer 是中转缓存；from_gpu=True 明确表示保存方向。
                 lmc_ops.fused_multi_layer_kv_transfer(
                     memory_obj.tensor,  # dst: CPU buffer
                     tmp_gpu_buffer,  # staging cache
@@ -893,13 +945,22 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
             # Force a synchronize if the target buffer is NOT CUDA device
             # NOTE: for better performance, we may not want to sync for every
             # memory object
+            # 中文：目标不是设备缓冲时强制同步，确保卸载完成；为减少开销，
+            # 批量路径会设置 no_sync，避免每个内存对象都单独同步。
             self.store_stream.synchronize()
 
         if self.use_mla:
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
 
     def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):
+        """中文导读：输入为一批内存对象及对应 token 范围，``kwargs`` 提供
+        kvcaches、slot_mapping 和可选 req_id，无显式返回值。
+        调用方向为引擎 ``retrieve`` → 本函数；普通对象在 load_stream 上逐个
+        调用 ``to_gpu``，ProxyMemoryObj 则走 P2P 拉取与散射流水线。
+        数据方向统一为 CPU/远端缓存 → NPU 分页 KV，返回前保证计算流能看到结果。
+        """
         # Check if any memory objects are ProxyMemoryObjs (deferred P2P fetch)
+        # 中文：检查是否含有代表延迟 P2P 拉取的 ProxyMemoryObj。
         has_proxy = any(isinstance(m, ProxyMemoryObj) for m in memory_objs)
 
         if has_proxy:
@@ -913,6 +974,9 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
             # load_stream.synchronize() in _remote_batched_to_gpu is
             # host-side only, the compute stream has no knowledge of it
             # and can race ahead.
+            # 中文：attention 读取相同页面前，计算流必须等待 load_stream
+            # 完成 KV 散射。_remote_batched_to_gpu 中的 synchronize 只等待
+            # 主机侧完成，计算流不会自动感知，仍可能提前执行。
             torch.npu.current_stream().wait_stream(self.load_stream)
         else:
             with torch.cuda.stream(self.load_stream):
@@ -1117,10 +1181,18 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
                     self.to_gpu(memory_obj, start, end, **kwargs)
 
     def batched_from_gpu(self, memory_objs, starts, ends, **kwargs):
+        """中文导读：输入为 ``allocate`` 分配的一批目标内存对象、对应 token
+        范围及 kvcaches/slot_mapping，返回本批 ``from_gpu`` 传输耗时（秒）。
+        调用方向为引擎 ``_run_store_pipeline`` → 本函数 → 各对象 ``from_gpu``；
+        数据方向为 NPU 分页 KV → CPU 内存对象，完成后由调用方 ``batched_put``
+        提交后端并接管引用。整批只同步一次，避免逐对象等待。
+        """
         # NOTE (gingfung):
         # Since no_sync is only consumed by us, for now we modify the kwargs directly.
         # We avoid per-object synchronization during batch transfers.
         # A single synchronization is performed at the end of the batch.
+        # 中文：no_sync 仅由本实现消费，因此直接修改 kwargs；批量传输不在
+        # 每个对象后同步，而在整批结束时统一同步一次。
         kwargs["no_sync"] = True
 
         ordering_event = kwargs.pop("ordering_event", None)
@@ -1145,6 +1217,7 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         from_gpu_time = start_event.elapsed_time(end_event)
 
         return from_gpu_time / 1000.0  # convert to seconds
+        # 中文：上一行将事件耗时从毫秒换算为秒。
 
     def get_shape(self, num_tokens: int) -> torch.Size:
         if self.kv_format == KVCacheFormat.MLA_KV:
@@ -1275,6 +1348,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             token sequence.
 
         :raises ValueError: If 'slot_mapping' is not provided in kwargs.
+
+        中文导读：输入为各缓存块的 token 范围和 kvcaches/slot_mapping/sync
+        参数，输出为逐层生成器；调用方在每次 ``yield`` 处送入该层内存对象，
+        共推进 num_layers + 2 次。调用方向为 vLLM/SGLang retrieve_layer →
+        本生成器；继承的 ``initialize_kvcaches_ptr`` 先接收缓存指针，数据再按
+        CPU 内存对象 → 可选 NPU staging 缓冲 → NPU 分页 KV 方向加载。
+        临时缓冲最终通过 ``ref_count_down`` 归还。
         """
 
         self.initialize_kvcaches_ptr(**kwargs)
@@ -1298,6 +1378,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             slot_mapping_chunks.append(slot_mapping[start:end])
 
         # TODO(Jiayi): Optimize away this `cat`
+        # 中文：待优化项——消除这次 slot_mapping 拼接开销。
         slot_mapping_full = torch.cat(slot_mapping_chunks, dim=0)
 
         num_tokens = len(slot_mapping_full)
@@ -1333,6 +1414,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             if layer_id > 0:
                 logger.debug("Finished loading layer %s", layer_id - 1)
             # memobj -> gpu_buffer -> kvcaches
+            # 中文：加载方向为 CPU 内存对象 → 可选 NPU 缓冲 → NPU 分页 KV。
             with torch.cuda.stream(self.load_stream):
                 if self.use_gpu:
                     cpu_tensors = []
@@ -1342,6 +1424,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         cpu_tensors.append(memory_obj.tensor)
 
                     # Fused transfer: N H2D memcpy + 1 scatter kernel
+                    # 中文：融合 N 次 H2D 复制和一次散射内核；to_gpu=False
+                    # 表示装入分页 KV，后续参数注明 KV 布局与 token 主序。
                     lmc_ops.batched_fused_single_layer_kv_transfer(
                         cpu_tensors,  # CPU memory objects
                         tmp_gpu_buffer_obj.tensor,  # GPU staging buffer
@@ -1374,10 +1458,12 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         yield
 
         # synchronize the last layer
+        # 中文：按需让当前计算流等待最后一层加载完成。
         if sync:
             current_stream.wait_stream(self.load_stream)
 
         # free the buffer memory
+        # 中文：通过 ref_count_down 归还临时 NPU 缓冲的引用。
         if self.use_gpu and tmp_gpu_buffer_obj is not None:
             tmp_gpu_buffer_obj.ref_count_down()
 
@@ -1412,6 +1498,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
             token sequence.
 
         :raises ValueError: If 'slot_mapping' is not provided in kwargs.
+
+        中文导读：输入为按层组织的目标 ``memory_objs``、token 范围及
+        kvcaches/slot_mapping/sync 参数，输出为逐层生成器，共推进
+        num_layers + 1 次。调用方向为 vLLM/SGLang 逐层保存入口 → 本生成器；
+        数据方向为 NPU 分页 KV → 可选 NPU staging 缓冲 → CPU 内存对象，
+        与 retrieve 的 ``batched_to_gpu`` 方向相反。各层完成后由上层提交存储，
+        临时缓冲通过 ``ref_count_down`` 归还。
         """
         self.initialize_kvcaches_ptr(**kwargs)
         assert self.kvcaches is not None, (
@@ -1464,6 +1557,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         for layer_id in range(self.num_layers):
             memory_objs_layer = memory_objs[layer_id]
             # kvcaches -> gpu_buffer -> memobj
+            # 中文：保存方向为 NPU 分页 KV → NPU 缓冲 → CPU 内存对象。
             with torch.cuda.stream(self.store_stream):
                 self.store_stream.wait_stream(current_stream)
 
@@ -1474,6 +1568,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         cpu_tensors.append(memory_obj.tensor)
 
                     # Fused transfer: 1 scatter kernel + N D2H memcpy
+                    # 中文：融合一次散射内核和 N 次 D2H 复制；from_gpu=True
+                    # 表示从分页 KV 卸载，后续参数注明 KV 布局与 token 主序。
                     lmc_ops.batched_fused_single_layer_kv_transfer(
                         cpu_tensors,
                         tmp_gpu_buffer_obj.tensor,
@@ -1508,12 +1604,19 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 self.store_stream.synchronize()
 
         # free the buffer memory
+        # 中文：通过 ref_count_down 归还临时 NPU 缓冲的引用。
         if self.use_gpu and tmp_gpu_buffer_obj is not None:
             tmp_gpu_buffer_obj.ref_count_down()
         yield
 
 
 class SGLangNPUConnector(SGLangGPUConnector):
+    """中文导读：本类保留上游非逐层 SGLang connector 实现，不新增覆写。
+    SGLang ``load_kv`` 经引擎 retrieve 调用基类的指针初始化及 to_gpu 路径，
+    数据由内存对象进入 NPU KV；``store_kv`` 经引擎 store 调用 from_gpu 路径，
+    数据由 NPU KV 进入已分配的内存对象，再交给 batched_put。
+    """
+
     pass
 
 
@@ -1594,6 +1697,13 @@ class SGLangLayerwiseNPUConnector(SGLangLayerwiseGPUConnector):
             token sequence.
 
         :raises ValueError: If 'slot_mapping' is not provided in kwargs.
+
+        中文导读：输入为各缓存块的 token 范围和 kvcaches/slot_mapping/sync
+        参数，输出为逐层生成器；调用方在每次 ``yield`` 处送入该层内存对象，
+        共推进 num_layers + 2 次。调用方向为 vLLM/SGLang retrieve_layer →
+        本生成器；继承的 ``initialize_kvcaches_ptr`` 先接收缓存指针，数据再按
+        CPU 内存对象 → 可选 NPU staging 缓冲 → NPU 分页 KV 方向加载。
+        临时缓冲最终通过 ``ref_count_down`` 归还。
         """
         self.initialize_kvcaches_ptr(**kwargs)
         assert self.kvcaches is not None, (
@@ -1642,6 +1752,7 @@ class SGLangLayerwiseNPUConnector(SGLangLayerwiseGPUConnector):
             current_layer_kv = (self.kvcaches[0][layer_id], self.kvcaches[1][layer_id])
 
             # memobj -> gpu_buffer -> kvcaches
+            # 中文：加载方向为 CPU 内存对象 → 可选 NPU 缓冲 → NPU 分页 KV。
             for start, end, memory_obj in zip(
                 starts, ends, memory_objs_layer, strict=False
             ):
@@ -1673,6 +1784,7 @@ class SGLangLayerwiseNPUConnector(SGLangLayerwiseGPUConnector):
                 )
 
         # free the buffer memory
+        # 中文：通过 ref_count_down 归还临时 NPU 缓冲的引用。
         if self.use_gpu:
             tmp_gpu_buffer_obj.ref_count_down()
 
@@ -1709,6 +1821,13 @@ class SGLangLayerwiseNPUConnector(SGLangLayerwiseGPUConnector):
             token sequence.
 
         :raises ValueError: If 'slot_mapping' is not provided in kwargs.
+
+        中文导读：输入为按层组织的目标 ``memory_objs``、token 范围及
+        kvcaches/slot_mapping/sync 参数，输出为逐层生成器，共推进
+        num_layers + 1 次。调用方向为 vLLM/SGLang 逐层保存入口 → 本生成器；
+        数据方向为 NPU 分页 KV → 可选 NPU staging 缓冲 → CPU 内存对象，
+        与 retrieve 的 ``batched_to_gpu`` 方向相反。各层完成后由上层提交存储，
+        临时缓冲通过 ``ref_count_down`` 归还。
         """
         self.initialize_kvcaches_ptr(**kwargs)
         assert self.kvcaches is not None, (
@@ -1750,6 +1869,7 @@ class SGLangLayerwiseNPUConnector(SGLangLayerwiseGPUConnector):
         for layer_id in range(self.num_layers):
             memory_objs_layer = memory_objs[layer_id]
             # kvcaches -> gpu_buffer -> memobj
+            # 中文：保存方向为 NPU 分页 KV → NPU 缓冲 → CPU 内存对象。
             current_layer_kv = (self.kvcaches[0][layer_id], self.kvcaches[1][layer_id])
 
             if self.use_gpu:
@@ -1792,6 +1912,7 @@ class SGLangLayerwiseNPUConnector(SGLangLayerwiseGPUConnector):
             logger.debug("Finished offloading layer %s", layer_id)
 
         # free the buffer memory
+        # 中文：通过 ref_count_down 归还临时 NPU 缓冲的引用。
         if self.use_gpu:
             tmp_gpu_buffer_obj.ref_count_down()
         yield
