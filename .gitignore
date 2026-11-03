@@ -21,6 +21,9 @@ schedule.log
 # Visual Studio Code
 .vscode/
 
+# Trae
+.trae/
+
 # claude
 CLAUDE.md
 .claude/
