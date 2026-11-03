@@ -2,7 +2,7 @@
 
 > 目标：在接入 LMCache 之前，先跑通一个**纯净的 SGLang 基线**——安装、起容器、启动推理服务、用 benchmark 量出 TTFT/TPOT/吞吐。后续所有优化（LMCache MP mode 适配等）都以这套基线数据作为对照组。
 >
-> 环境约定：宿主机 8×Ascend 910B4（A2），模型 `/workspace/models/Qwen3.8-27B`，容器内同路径挂载。
+> 环境约定：宿主机 8×Ascend 910B4（A2），模型 `/data/models/Qwen`，容器内同路径挂载。
 
 ---
 
@@ -29,7 +29,7 @@ npu-smi info
 ls /dev/davinci*     # 应有 davinci0~7、davinci_manager、devmm_svm、hisi_hdc
 
 # 3) 确认模型目录
-ls /workspace/models/Qwen3.8-27B/   # 应有 *.safetensors、config.json、tokenizer 等
+ls /data/models/Qwen/   # 应有 *.safetensors、config.json、tokenizer 等
 ```
 
 ---
@@ -62,6 +62,7 @@ docker run -itd \
   --ipc=host \
   --privileged=true \
   -v /workspace:/workspace \
+  -v /data:/data \
   -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
   -v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
   -v /usr/local/sbin:/usr/local/sbin \
@@ -111,7 +112,7 @@ export OMP_NUM_THREADS=8
 export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
 
 python -m sglang.launch_server \
-  --model-path /workspace/models/Qwen3.8-27B \
+  --model-path /data/models/Qwen \
   --served-model-name Qwen3.8-27B \
   --tp-size 8 \
   --host 0.0.0.0 \

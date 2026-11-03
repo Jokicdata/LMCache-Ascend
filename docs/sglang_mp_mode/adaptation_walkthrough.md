@@ -6,6 +6,60 @@
 >
 > 重要结论：**不要从重写 SGLang connector 开始。** 上游 LMCache 已经提供 SGLang MP 集成；当前优先做版本和接口审计。版本齐全时，第一阶段可能不需要修改产品代码。
 
+## 0. 面向初学者的背景：vLLM、SGLang 与本次适配的关系
+
+### 0.1 vLLM 和 SGLang 分别是什么
+
+vLLM 和 SGLang 都是大模型推理引擎，负责接收请求、调度 prefill/decode、管理显存中的 KV Cache，并调用模型完成计算。它们不是模型本身，模型目录只提供权重、配置和 tokenizer。
+
+可以把 LMCache 理解为挂在推理引擎旁边的“外部 KV 缓存服务”，把 LMCache-Ascend 理解为让这个缓存服务能在昇腾 NPU 上高效搬运数据的插件：
+
+```text
+请求 → vLLM 或 SGLang → 模型计算
+                │
+                └── LMCache → LMCache-Ascend → CANN / NPU
+```
+
+### 0.2 当前已经完成的 vLLM 工作是什么
+
+当前主线已经形成一条 vLLM MP 路径：
+
+```text
+vllm serve
+  → LMCacheMPConnector
+  → 独立 lmcache server
+  → NPU IPC / 共享内存
+  → LMCache-Ascend 原生块传输 kernel
+```
+
+其中包括 vLLM connector 生命周期、NPU KV 注册、块大小处理、MP 数据面、异步事件，以及相应部署文档和测试。这里的“已适配”指 **vLLM + LMCache MP + Ascend** 这条组合路径，不代表任意引擎都能自动复用同一套上层接口。
+
+### 0.3 SGLang 适配与 vLLM 有什么不同
+
+| 对比项 | vLLM 现有路径 | SGLang 要验证/适配的路径 |
+|---|---|---|
+| 接入方式 | `--kv-transfer-config` 指定 `LMCacheMPConnector` | `--enable-lmcache` + `--lmcache-config-file` |
+| 上层 connector | vLLM `LMCacheMPConnector` | 上游 `UnifiedLMCacheMPConnector` |
+| KV 组织 | vLLM paged KV buffer / layer dict | SGLang K/V pool、unified cache 的 FULL/SWA/MAMBA component |
+| 进程协作 | vLLM scheduler role 与 worker role | SGLang scheduler、TP worker 和本地 RadixCache/unified cache 协作 |
+| 本地前缀缓存 | vLLM prefix caching | SGLang RadixAttention / unified radix cache |
+| 配置形式 | JSON connector 配置 | SGLang 参数 + LMCache YAML |
+| 当前工作 | 已有 Ascend MP 主线和文档 | 审计上游接口，验证 NPU 注册和端到端闭环，按真实差异补小 patch |
+
+两种引擎可以共享 `lmcache server`、缓存索引、存储后端和 Ascend 原生 kernel，**不能直接共享所有 connector 和 KV 生命周期代码**。因此本次工作的重点是“把上游已有的 SGLang MP 控制面接到现有 Ascend 数据面”，而不是把 vLLM connector 逐行翻译成 SGLang。
+
+### 0.4 为什么还要做接口审计
+
+“上游支持 SGLang”“本仓支持 Ascend”“当前模型能启动”是三个独立条件。只有以下条件同时成立，才可能零代码跑通：
+
+1. 当前 LMCache 包含 `UnifiedLMCacheMPConnector`；
+2. 当前 SGLang 能调用这套 unified MP 接口；
+3. 当前模型的 KV/MAMBA layout 能被上游 adapter 识别；
+4. NPU IPC、块传输和异步事件在 TP8 下正常；
+5. SGLang 的 block/chunk 语义与 LMCache 对齐。
+
+接口审计就是先把这五件事分清，避免一开始改错仓库、改错层。
+
 ## 1. 先回答三个基础问题
 
 ### 1.1 当前仓库包含完整 LMCache 源码吗
@@ -422,7 +476,7 @@ curl -s http://127.0.0.1:8080/healthcheck
 ```bash
 export PYTHONHASHSEED=0
 python -m sglang.launch_server \
-  --model-path /data/models/Qwen3.8-27B \
+  --model-path /data/models/Qwen \
   --served-model-name Qwen3.8-27B \
   --host 0.0.0.0 --port 8998 \
   --tp-size 8 \
@@ -573,6 +627,64 @@ tests/integration/sglang/
 ```
 
 核心原则：**先证明现有上游实现能不能跑，再写适配代码；先修控制面，再修数据面；先保证正确，再谈性能。**
+
+## 14. 依赖安装完成后的立即执行清单
+
+当 LMCache、依赖和 LMCache-Ascend 都已安装后，先不要改代码，按下面顺序执行。
+
+### 第一步：确认安装和 NPU 后端
+
+```bash
+python - <<'PY'
+import torch
+import torch_npu
+import numba
+import aiofile
+import lmcache
+import lmcache_ascend
+import lmcache_ascend.c_ops as ops
+
+print("lmcache:", lmcache.__file__)
+print("lmcache_ascend:", lmcache_ascend.__file__)
+print("c_ops:", ops.__file__)
+print("npu_available:", torch.npu.is_available())
+print("npu_count:", torch.npu.device_count())
+PY
+
+lmcache server --help
+```
+
+如果仍出现 `CLI-only mode`，先回到依赖安装文档，不要继续启动 MP 服务。
+
+### 第二步：执行并保存接口审计
+
+执行本文第 5.1 节的完整 Python 审计脚本，并将输出保存到：
+
+```text
+/workspace/results/sglang_mp_api_audit.log
+```
+
+再执行第 5.2 节的两条 `grep`，确认 SGLang 实际挂接点和 MAMBA component 支持情况。
+
+### 第三步：验证 NPU 原生 MP 数据面
+
+```bash
+cd /workspace/src/LMCache-Ascend
+pytest -q tests/v1/multiprocess/test_npu_lmcache_driven_e2e.py -s \
+  2>&1 | tee /workspace/results/npu_mp_native_e2e.log
+```
+
+### 第四步：先分析结果，再决定代码修改
+
+审计全部通过后，第一次启动仍然先使用现有上游实现，不主动添加 patch。只有出现真实、可复现的错误后，才按第 6 节判断错误属于 SGLang、上游 LMCache 还是 LMCache-Ascend。
+
+需要保留并用于定位问题的材料：
+
+- 三个仓库的版本和 commit；
+- `sglang_mp_api_audit.log`；
+- `npu_mp_native_e2e.log`；
+- 第一次启动时最早的完整异常栈；
+- 当前 Qwen3.8 的 attention block size 日志。
 
 ## 参考资料
 
