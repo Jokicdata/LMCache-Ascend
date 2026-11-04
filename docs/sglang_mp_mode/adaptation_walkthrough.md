@@ -60,6 +60,276 @@ vllm serve
 
 接口审计就是先把这五件事分清，避免一开始改错仓库、改错层。
 
+### 0.5 背景知识补充：Connector、本地前缀缓存与配置本质
+
+#### 0.5.1 先统一几个最常用术语
+
+| 术语 | 小白版解释 |
+|---|---|
+| token | 模型处理文本的基本单位；prompt 长度、KV 大小、chunk 大小都按 token 计算 |
+| KV Cache | attention 计算时产生的 Key/Value 中间结果；后续 token 可以复用，避免重复计算 |
+| 前缀（prefix） | 一个请求开头的一段 token；两个请求可以问题不同，但前缀完全相同 |
+| block | 推理引擎管理 KV 显存的块；SGLang/vLLM 的 block 语义需要与 LMCache 对齐 |
+| chunk | LMCache 做 hash、查找、存储和传输时的 token 块 |
+| TTFT | Time To First Token，首 token 延迟；长前缀命中缓存时主要改善这个指标 |
+| TPOT/ITL | 后续 token 的输出间隔；KV 前缀复用不保证改善它 |
+| lookup | 查询“这个前缀在缓存里有多少 token 可用” |
+| retrieve | 把命中的 KV 从缓存读回推理引擎 |
+| store | 把引擎已经计算的 KV 写入缓存 |
+| hit / miss | 命中可复用前缀 / 未命中，需要重新 prefill |
+
+例如：
+
+```text
+请求 A = [同一套系统提示词 3000 token][问题 A]
+请求 B = [同一套系统提示词 3000 token][问题 B]
+```
+
+这里可复用的是前面的 3000 token，不是要求 A/B 整道题一模一样。
+
+#### 0.5.2 本地前缀缓存和 LMCache 不是同一个东西
+
+vLLM 有 Automatic Prefix Caching，SGLang 有 RadixAttention/RadixCache。它们和外部 LMCache 都可以复用前缀，但位置和能力不同：
+
+| 对比项 | 引擎本地前缀缓存 | 外部 LMCache |
+|---|---|---|
+| 所在位置 | 推理引擎进程和 NPU 显存内 | 独立缓存进程，CPU L1、磁盘或远端 L2 |
+| 生命周期 | 容易随请求、显存压力或引擎重启而淘汰 | 可以独立存在，生命周期不完全依附于引擎 |
+| 容量 | 受显存限制，通常较小 | 可以用更大的主机内存或外部存储 |
+| 共享范围 | 通常当前引擎实例内部 | 可以跨进程、跨引擎实例共享 |
+| 命中速度 | 通常最快 | 多一次查找和数据回灌，但通常仍比重新 prefill 快 |
+| 主要价值 | 复用当前热数据 | 保存更多冷/温数据，扩大可复用工作集 |
+
+实际读取顺序可以简化为：
+
+```text
+新请求到来
+  → 先查引擎本地前缀缓存
+  → 本地没有足够前缀，再查 LMCache
+  → 仍未命中，才重新 prefill
+```
+
+因此验证 LMCache 时，要执行：
+
+```bash
+curl -s -X POST http://127.0.0.1:8998/flush_cache
+```
+
+清掉 SGLang 本地 RadixCache。否则第二次请求可能只命中本地缓存，你无法证明数据来自 LMCache。
+
+#### 0.5.3 LMCacheMPConnector 到底是什么
+
+Connector 中文可以理解为“连接器/桥接器”。它**不是缓存服务器，也不是模型的一部分**，主要职责是：
+
+1. 把推理引擎的 KV pool 注册给 LMCache；
+2. 在合适时机发起 lookup、retrieve、store；
+3. 把引擎的 block/slot/layout 信息翻译成 LMCache 能理解的形式；
+4. 处理异步事件、请求结束和缓存生命周期。
+
+以 SGLang 为例：
+
+```text
+SGLang
+  └── UnifiedLMCacheMPConnector       上层桥接
+        └── SGLangUnifiedKVAdapter    KV component/layout 映射
+              └── MP transfer context 跨进程传输上下文
+                    └── NpuIPCWrapper NPU IPC 句柄
+                          └── lmcache server / Ascend 原生 kernel
+```
+
+它解决的是“引擎和缓存服务如何协作”。真正保存索引、执行 LRU、分配 L1/L2 的是 `lmcache server`；真正在 NPU 上搬运数据的是 MP cache context 和 LMCache-Ascend 原生实现。
+
+#### 0.5.4 vLLM 的 JSON connector 配置本质是什么
+
+vLLM 常见写法：
+
+```bash
+vllm serve /data/models/Qwen \
+  --kv-transfer-config '{
+    "kv_connector": "LMCacheMPConnector",
+    "kv_role": "kv_both",
+    "kv_connector_extra_config": {
+      "lmcache.mp.host": "tcp://127.0.0.1",
+      "lmcache.mp.port": 5556,
+      "lmcache.mp.mp_transfer_mode": "lmcache_driven"
+    }
+  }'
+```
+
+这段 JSON 的作用是**告诉 vLLM 加载哪个 connector、承担什么角色、连接哪个缓存服务**：
+
+| 字段 | 含义 |
+|---|---|
+| `kv_connector` | connector 名称；这里选择 `LMCacheMPConnector` |
+| `kv_role` | `kv_both` 表示既可以 store，也可以 retrieve；producer/consumer 常用于 PD 分离的数据方向控制 |
+| `lmcache.mp.host` | LMCache 控制面地址，不是模型地址 |
+| `lmcache.mp.port` | LMCache 控制请求端口，需要与 server 的 `--port` 一致 |
+| `lmcache.mp.mp_transfer_mode` | 数据面由谁执行搬运；NPU 当前优先使用 `lmcache_driven` |
+
+JSON 不是：
+
+- 模型配置；
+- KV 数据本身；
+- `lmcache server` 的完整配置；
+- 启动缓存服务器的命令。
+
+`lmcache server` 仍需独立启动，L1 容量、LRU、chunk size 等由 server CLI/配置决定。
+
+**这段 JSON 是 vLLM 的接入方式，不要原样复制到 SGLang 启动命令里。**
+
+#### 0.5.5 当前 SGLang 的配置方式本质是什么
+
+SGLang 使用“启动参数 + YAML”，而不是 vLLM 的 JSON connector 参数：
+
+```bash
+python -m sglang.launch_server \
+  --model-path /data/models/Qwen \
+  其他原有参数... \
+  --enable-lmcache \
+  --lmcache-config-file /workspace/scripts/lmcache_mp.yaml
+```
+
+两个参数分别负责：
+
+| 参数 | 作用 |
+|---|---|
+| `--enable-lmcache` | 打开 SGLang 的 LMCache 接入路径；仅仅安装包并不会自动启用 |
+| `--lmcache-config-file` | 告诉 SGLang connector 使用哪个缓存服务和 chunk 配置 |
+
+当前 YAML 示例：
+
+```yaml
+mp_host: tcp://127.0.0.1
+mp_port: 5556
+chunk_size: 256
+```
+
+其中 `chunk_size: 256` 只是格式示例。Qwen3.8 实际应替换为从 SGLang 日志确认的、与 attention block size 对齐的 N。
+
+与此同时，独立 server 还要配置：
+
+```bash
+lmcache server \
+  --host 127.0.0.1 --port 5556 \
+  --chunk-size "$N" \
+  --l1-size-gb 20 \
+  --eviction-policy LRU \
+  --supported-transfer-mode lmcache_driven
+```
+
+可以把配置分成三类理解：
+
+| 配置位置 | 决定什么 |
+|---|---|
+| SGLang 启动参数 | 是否启用 LMCache、模型如何启动 |
+| SGLang YAML | connector 连接哪个 server、使用什么 chunk |
+| server CLI | server 如何监听、L1 多大、如何淘汰、使用什么传输模式 |
+
+`--enable-lmcache` 不会替你完成上述 server 的独立启动。
+
+#### 0.5.6 控制面和数据面分别是什么
+
+```text
+控制面：lookup、注册、store/retrieve 请求、完成通知
+        数据量小，通常走 ZMQ/gRPC
+
+数据面：真正的 KV 大块数据
+        数据量大，走 NPU IPC、共享内存、staging + 原生 kernel
+```
+
+当前优先使用 `lmcache_driven`：
+
+```text
+SGLang 提交请求
+  → lmcache server 根据 NPU IPC 句柄找到 KV
+  → server 调用 NPU cache context
+  → Ascend 原生块传输 kernel 执行搬运
+```
+
+`engine_driven` 则由引擎 worker 自己执行 gather/scatter。它是另一种数据面实现，不等于 MP/非 MP 的区别；两种都属于 MP 架构。
+
+#### 0.5.7 用一个完整例子串起配置和代码
+
+假设请求 A 和 B 共享一个长前缀：
+
+```text
+A 到达
+  → SGLang 的 enable_lmcache 路径生效
+  → UnifiedLMCacheMPConnector 注册/使用 KV pool
+  → lookup 未命中
+  → SGLang 正常 prefill
+  → store 请求到 lmcache server
+  → NPU KV 经数据面保存，日志出现 Stored
+
+清掉 SGLang 本地 RadixCache
+
+B 到达，前缀相同、尾部不同
+  → connector lookup 命中
+  → retrieve 请求到 lmcache server
+  → KV 回灌到 SGLang 的 KV pool
+  → SGLang 只计算未命中尾部
+  → 日志出现 Retrieved，TTFT 有望下降
+```
+
+对应的代码阅读入口：
+
+```text
+/workspace/src/LMCache/lmcache/integration/sglang/
+  ├── unified_lmcache_mp_connector.py   connector 与 MP 请求生命周期
+  └── unified_kv_adapter.py            FULL/SWA/MAMBA component 映射
+
+/workspace/src/LMCache/lmcache/v1/multiprocess/
+  └── transfer_context/worker_transfer.py
+
+/workspace/src/LMCache-Ascend/lmcache_ascend/
+  ├── __init__.py                       插件加载与 patch
+  └── v1/shape_desc.py                  KV plane/stride 几何信息
+
+/workspace/src/LMCache-Ascend/csrc/
+  ├── pybind.cpp                        Python → C++ 函数绑定
+  └── mp_mem_kernels.cpp                实际块传输
+```
+
+可以在容器中直接查看连接器源码位置和公开方法：
+
+```bash
+python - <<'PY'
+import inspect
+from lmcache.integration.sglang.unified_lmcache_mp_connector import (
+    UnifiedLMCacheMPConnector,
+)
+
+print("source:", inspect.getfile(UnifiedLMCacheMPConnector))
+print("public methods:")
+for name in dir(UnifiedLMCacheMPConnector):
+    if not name.startswith("_"):
+        print(" ", name)
+PY
+```
+
+本仓 `shape_desc.py` 中的关键逻辑是：
+
+```python
+desc.num_planes = len(planes)
+desc.plane_slot_bytes = tuple(
+    int(t.shape[2]) * int(t.shape[3]) * int(t.element_size())
+    for t in planes
+)
+desc.plane_block_stride_bytes = tuple(
+    int(t.stride(0)) * int(t.element_size()) for t in planes
+)
+```
+
+这不是 connector 的调度代码，而是在告诉原生 kernel：“每层有几个 KV plane、每个 token 多少字节、每个 block 怎么寻址”。随后 `csrc/pybind.cpp` 把 `multi_layer_block_kv_transfer`、`execute_object_group_transfer` 等函数暴露给上游 Python 调用。
+
+#### 0.5.8 最容易混淆的五句话
+
+1. **安装 LMCache 不等于推理服务自动使用 LMCache**，还需要启动 server 并显式启用 connector。
+2. **Connector 不等于 server**，前者负责桥接，后者负责缓存管理。
+3. **本地 RadixCache 命中不等于 LMCache 命中**，验证时要 flush 本地缓存。
+4. **vLLM JSON 与 SGLang YAML 都是接入配置，但字段和加载机制不同**，不能混抄。
+5. **控制面连通不等于 KV 数据面正确**，还必须验证真实 Stored/Retrieved 和数据一致性。
+
 ## 1. 先回答三个基础问题
 
 ### 1.1 当前仓库包含完整 LMCache 源码吗
