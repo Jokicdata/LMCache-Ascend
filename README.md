@@ -107,6 +107,7 @@ For the `engine_driven` transfer mode (workers copy KV from a named SHM pool), s
 
 ## Documentation
 
+- [docs/connector_explained_zh.md](docs/connector_explained_zh.md) — 中文 connector 详解：它是什么、属于谁、在本仓库哪里（vLLM/SGLang/MP）。
 - [docs/mp_mode/README.md](docs/mp_mode/README.md) — MP mode overview.
 - [docs/mp_mode/lmcache_driven.md](docs/mp_mode/lmcache_driven.md) — `lmcache_driven` full deployment guide (environment preparation, container, installation, server, vLLM, verification).
 - [docs/mp_mode/engine_driven.md](docs/mp_mode/engine_driven.md) — `engine_driven` deployment guide (Qwen3 example).
