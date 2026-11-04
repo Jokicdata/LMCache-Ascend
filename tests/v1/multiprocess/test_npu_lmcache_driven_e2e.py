@@ -19,6 +19,33 @@ worker 进程持有分页的 MLA 元组 KV plane，通过聚合 plane 的
 NPU plane 按层 gather 到主机端 -> 同步传输流后校验并修改主机字节 ->
 ``retrieve`` 将主机字节 scatter 回相同 NPU block -> 再次同步并校验。
 这里的 CPU 空间仅用于测试对象读写，不是生产 KV pool 分配器。
+
+【先区分：这不是“接口审计”脚本】
+接口审计通常只做模块导入和符号存在性检查，例如确认
+``UnifiedLMCacheMPConnector``、``NpuDeviceSpec`` 能否 import。本文件则
+进一步在真实 NPU 上启动独立 worker 进程，执行跨进程 KV 数据往返，因此
+验证的是 NPU 原生 MP 数据面，而不是只检查 API 是否存在。
+
+【离线运行方式】
+测试 bootstrap 默认寻找 ``/workspace/LMCache``，不存在时会尝试联网 clone。
+如果上游源码已经在其他本地目录，必须显式指定，避免重复下载：
+
+    export LMCACHEPATH=/workspace/src/LMCache
+    pytest -q tests/v1/multiprocess/test_npu_lmcache_driven_e2e.py -s
+
+【本测试证明什么】
+1. NPU 能选择并创建 ``LMCacheDrivenTransferContext``；
+2. 子进程能通过 NPU IPC wrapper 导出 KV plane 和进程间事件；
+3. 父进程能创建真实 NPU cache context，识别 MLA plane 布局；
+4. ``store`` 能把 NPU KV gather 到 CPU 暂存对象；
+5. ``retrieve`` 能把修改后的 CPU 数据 scatter 回相同 NPU block；
+6. 往返前后数据内容一致，且 npu:0/npu:1 两条参数化路径均覆盖。
+
+【本测试不证明什么】
+它没有启动完整 SGLang/vLLM 服务，也没有覆盖 scheduler 调度、真实模型
+prefill/decode、TP8 全 worker 注册、SGLang RadixCache 或 Qwen3.8 的
+MAMBA state 生命周期。即使本测试全部通过，也仍需继续做真实引擎的
+MP 启动和 Stored/Retrieved 端到端验证。
 """
 
 # Standard
@@ -39,6 +66,10 @@ import torch_npu  # noqa: F401
 # 本项目测试辅助模块
 from tests.bootstrap import prepare_environment
 
+# 准备上游 LMCache 源码和测试别名：
+# 1. 若设置 LMCACHEPATH，则直接使用该本地目录，不访问网络；
+# 2. 将上游 tests 注册为 lmcache_tests，供自定义 IPC 编解码测试复用；
+# 3. 这一步只准备测试环境，不会启动 lmcache server 或推理引擎。
 prepare_environment()
 
 # Third Party
@@ -64,6 +95,10 @@ from tests.v1.multiprocess.test_custom_types import (  # noqa: E402
 import lmcache_ascend  # noqa: F401, E402  (applies plugin patches)
 # 导入 lmcache_ascend 以应用插件补丁。
 
+# 测试数据尺寸：
+# NL=4 层；NB=16 个 block；BS=16 个 token/block，因此一个 chunk 为 256 token。
+# 每层由 latent(128 维) 和 rope(16 维) 两个 plane 组成，合并隐藏宽度为 144。
+# 这些值只用于构造可逐字节校验的小型 MLA 测试布局，不是 Qwen 模型的配置。
 NL = 4
 NB = 16
 BS = 16
