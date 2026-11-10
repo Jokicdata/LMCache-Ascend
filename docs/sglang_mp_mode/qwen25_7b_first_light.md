@@ -123,10 +123,80 @@ ls -la /data/models/
 | Qwen3-32B / Qwen2.5-14B 等纯 dense 模型 | ✅ 可替代 | 都是标准 GQA，跳过 3.2~3.3，直接进第 4 步（注意改模型路径和 served-model-name，32B 建议保持 TP8） |
 | 只有 Qwen3.8-27B | ➕ 需下载 | 它是 hybrid，本教程用不了，走 3.2 |
 
-### 3.2 下载 Qwen2.5-7B-Instruct（在**有网的 Windows 宿主机**上）
+### 3.2 下载 Qwen2.5-7B-Instruct（昇腾服务器可直接下载，推荐）
 
-模型约 **15.4 GB**（5 个 safetensors 分片 + tokenizer + config）。国内网络必须走
-hf-mirror.com 镜像：
+模型约 **15.4 GB**（5 个 safetensors 分片 + tokenizer + config）。你的服务器此前已确认
+可通过 **netentsec 代理**访问外网，所以不必绕道 Windows 宿主机，直接在服务器上下载。
+
+#### 3.2.0 第 0 步：连通性自测（30 秒，决定走哪条下载通道）
+
+```bash
+# 测 1：hf-mirror 国内镜像直连（不需要代理，多数内网也能通）
+curl -sS -o /dev/null -w "hf-mirror: %{http_code} (%{time_total}s)\n" \
+  --max-time 10 https://hf-mirror.com || echo "hf-mirror: 不可达"
+
+# 测 2：代理通道（代理地址按 network_and_offline_install.md 里确认的那个填，
+#        通常形如 http://<代理IP>:<端口>）
+export https_proxy=http://<代理IP>:<端口> http_proxy=http://<代理IP>:<端口>
+curl -sS -o /dev/null -w "proxy->hf: %{http_code} (%{time_total}s)\n" \
+  --max-time 10 https://huggingface.co || echo "proxy->hf: 不可达"
+
+# 测 3：ModelScope 魔搭（国内站，一般直连就通，Qwen 官方同步发布）
+curl -sS -o /dev/null -w "modelscope: %{http_code} (%{time_total}s)\n" \
+  --max-time 10 https://modelscope.cn || echo "modelscope: 不可达"
+```
+
+按结果选通道：**测 1 通 → 走 A1；只有测 2 通 → 走 A2；想最稳 → 走 A3**。
+
+#### 3.2.A1 通道一：hf-mirror 直连（服务器上，免代理）
+
+```bash
+# 下载到 /data/models/（这是容器挂载卷，容器重建不丢，且容器内直接可见）
+export HF_ENDPOINT=https://hf-mirror.com
+pip install -U "huggingface_hub[cli]"   # 若 pip 超时，先 export 上面代理再装
+
+huggingface-cli download Qwen/Qwen2.5-7B-Instruct \
+  --local-dir /data/models/Qwen2.5-7B-Instruct
+```
+
+#### 3.2.A2 通道二：代理 + HF 官方源（服务器上）
+
+```bash
+export https_proxy=http://<代理IP>:<端口> http_proxy=http://<代理IP>:<端口>
+pip install -U "huggingface_hub[cli]"
+
+huggingface-cli download Qwen/Qwen2.5-7B-Instruct \
+  --local-dir /data/models/Qwen2.5-7B-Instruct
+# 下载期间代理变量保持导出状态；下载完成后记得 unset，避免影响后续容器内服务通信
+```
+
+#### 3.2.A3 通道三：ModelScope 魔搭（国内最快最稳，Qwen 官方同步）
+
+```bash
+pip install -U modelscope   # 同理，pip 不通就先挂代理
+
+modelscope download --model Qwen/Qwen2.5-7B-Instruct \
+  --local_dir /data/models/Qwen2.5-7B-Instruct
+```
+
+#### 3.2.1 下载后校验（无论哪条通道）
+
+```bash
+ls -lh /data/models/Qwen2.5-7B-Instruct/
+# 预期看到: model-00001-of-00005.safetensors ~ model-00005-of-00005.safetensors
+#          config.json  tokenizer.json  tokenizer_config.json  ...
+
+du -sh /data/models/Qwen2.5-7B-Instruct/
+# 预期约 15GB；明显偏小说明分片没下全，重跑同一条下载命令会断点续传补齐
+```
+
+> 下载目标统一放 `/data/models/`（容器挂载卷）：**如果直接在容器内的 shell 里跑上面
+> 命令，文件即刻可见，跳过 3.3；如果在宿主机 shell 里跑，且 /data 的挂载源就是这个
+> 目录，容器内同样直接可见，也跳过 3.3。** 只有下载到了非挂载路径才需要 3.3 的搬运。
+
+### 3.3 （备选路线）Windows 宿主机下载后传入容器
+
+> 仅当服务器三条下载通道全断时才走这条老路（与之前传 wheelhouse 同一流程）。
 
 ```powershell
 # Windows PowerShell
@@ -138,17 +208,13 @@ huggingface-cli download Qwen/Qwen2.5-7B-Instruct `
   --local-dir "D:\hf-downloads\Qwen2.5-7B-Instruct"
 ```
 
-校验完整性（5 个 safetensors 分片都在才算完整）：
+校验（5 个分片都在才算完整）：
 
 ```powershell
 Get-ChildItem "D:\hf-downloads\Qwen2.5-7B-Instruct" | Format-Table Name, Length
-# 预期看到: model-00001-of-00005.safetensors ~ model-00005-of-00005.safetensors
-#          config.json  tokenizer.json  tokenizer_config.json  ...
 ```
 
-### 3.3 传入容器（用你之前传 wheelhouse 的同一条路）
-
-先把文件从 Windows 传到昇腾服务器（scp / 共享目录均可），然后在服务器上：
+然后把文件从 Windows 传到昇腾服务器（scp / 共享目录均可），再在服务器上：
 
 ```bash
 # 服务器上：拷入容器（容器名按实际替换，docker ps 查看）
