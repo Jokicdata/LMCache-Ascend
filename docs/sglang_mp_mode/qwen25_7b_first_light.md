@@ -230,16 +230,37 @@ docker cp /path/on/server/Qwen2.5-7B-Instruct <容器名>:/data/models/Qwen2.5-7
 ```bash
 ls -lh /data/models/Qwen2.5-7B-Instruct/
 python - <<'PY'
-import json
+import json, math
 c = json.load(open('/data/models/Qwen2.5-7B-Instruct/config.json'))
 print("architectures:", c["architectures"])          # 预期 Qwen2ForCausalLM
 print("layers:", c["num_hidden_layers"])              # 预期 28
 print("q_heads:", c["num_attention_heads"])           # 预期 28
 print("kv_heads:", c["num_key_value_heads"])          # 预期 4（GQA，标准模型特征）
+gcd = math.gcd(c["num_attention_heads"], c["num_key_value_heads"])
+valid_tp = [t for t in range(1, gcd + 1) if gcd % t == 0]
+print("有效 TP 取值（头数整除约束）:", valid_tp)       # 预期 [1, 2, 4]
 PY
 ```
 
 `num_key_value_heads < num_attention_heads` 即为标准 GQA —— 正是我们要的。
+
+### 3.4.1 TP 整除约束（换模型必查，实测踩坑记录）
+
+**TP 并行要求 `num_attention_heads` 和 `num_key_value_heads` 都能被 tp_size 整除**，
+否则启动即崩在 `qwen2.py` 的断言：
+
+```text
+assert self.total_num_heads % tp_size == 0
+AssertionError
+```
+
+| 模型 | Q 头 | KV 头 | 最大有效 TP |
+|---|---|---|---|
+| Qwen2.5-7B-Instruct | 28 | 4 | **4**（1/2/4 可用，8 不可用） |
+| Qwen3.8-27B（hybrid） | 能被 8 整除 | 能被 8 整除 | 8 |
+
+Qwen3.8 基线命令里的 `--tp-size 8` **不能照搬**给 Qwen2.5-7B——2026-11-10 实测
+TP8 启动即崩，本文档统一改用 **TP4**（用 4 张卡，其余 4 张空闲）。
 
 ---
 
@@ -279,8 +300,9 @@ lmcache server \
 
 ## 5. 第 3 步：启动 SGLang（终端 B）
 
-与 Qwen3.8 基线命令相比，**三处变化**：模型路径、名字、**去掉 `--mamba-ssm-dtype`**
-（那是 hybrid GDN 层的专属参数，标准模型不需要）：
+与 Qwen3.8 基线命令相比，**四处变化**：模型路径、名字、**去掉 `--mamba-ssm-dtype`**
+（那是 hybrid GDN 层的专属参数，标准模型不需要）、**TP8 改 TP4**（头数整除约束，
+见 3.4.1 节）：
 
 ```bash
 export PYTHONHASHSEED=0
@@ -288,7 +310,7 @@ python -m sglang.launch_server \
   --model-path /data/models/Qwen2.5-7B-Instruct \
   --served-model-name Qwen2.5-7B-Instruct \
   --host 0.0.0.0 --port 8998 \
-  --tp-size 8 --dtype bfloat16 \
+  --tp-size 4 --dtype bfloat16 \
   --context-length 8192 --chunked-prefill-size 4096 \
   --mem-fraction-static 0.85 --trust-remote-code \
   --enable-lmcache \
@@ -296,14 +318,18 @@ python -m sglang.launch_server \
   2>&1 | tee /workspace/results/sglang_mp_qwen25.log
 ```
 
-> 保持 TP8：本教程的隐性目标之一是验证 8 个 rank 全部完成 NPU 上下文注册。
+> 启动前**必须确认旧服务已停**（第 2 步的 npu-smi 检查）。一个实测教训：
+> 2026-11-10 首次启动时日志显示 `Load weight begin. avail mem=2.59 GB`（正常应为
+> 约 29 GB）——原因是 Qwen3.8 的旧服务还在跑，占着每卡约 26.5 GB。看到 avail mem
+> 异常低就先回去杀进程，别改任何参数。
 
-### 启动日志三个观察点（按语义找，不机械匹配）
+### 启动日志四个观察点（按语义找，不机械匹配）
 
 | # | 找什么 | 含义 |
 |---|---|---|
+| 0 | `Load weight begin. avail mem≈29 GB`（不是 2.x GB） | 旧服务已清干净 |
 | 1 | **过了 `lmc_radix_cache.py` 的初始化**（不再出现 `k_buffer` AttributeError） | 标准池路线打通第一关 |
-| 2 | `Creating transfer context (device_type=npu, mode=lmcache_driven)` × 8 | 每个 TP rank 都连上了 NPU 数据面 |
+| 2 | `Creating transfer context (device_type=npu, mode=lmcache_driven)` × 4 | 每个 TP rank 都连上了 NPU 数据面 |
 | 3 | server 日志（终端 A）出现 KV 注册 / engine 相关条目 | 旧 connector 与新 server 完成握手 |
 
 任何一个观察点失败 → 直接跳到第 8 节决策树，把**最早的那条完整 traceback** 留档。
@@ -371,13 +397,13 @@ grep -E "Stored|Retrieved" /workspace/results/lmcache_server_qwen25.log | tail -
 
 ### 7.3 验收清单（全勾才算"首亮"）
 
-- [ ] 启动无 `k_buffer` 报错，8 rank 都有 npu transfer context
+- [ ] 启动无 `k_buffer` 报错，4 rank 都有 npu transfer context
 - [ ] 冷请求输出正常（不是乱码/空回复）
 - [ ] server 日志出现 `Stored ... tokens`
 - [ ] `flush_cache` 后热请求输出正常
 - [ ] server 日志出现 `Retrieved ... tokens`
 - [ ] 两次输出语义一致（temperature=0 下应基本相同）
-- [ ] TP8 无死锁（第二次请求能正常返回）
+- [ ] TP4 无死锁（第二次请求能正常返回）
 
 **全部勾上 = LMCache-Ascend MP mode 在 SGLang + 昇腾 + 标准模型上首亮成功。**
 
@@ -387,9 +413,12 @@ grep -E "Stored|Retrieved" /workspace/results/lmcache_server_qwen25.log | tail -
 
 | 症状 | 含义 | 动作 |
 |---|---|---|
+| `assert self.total_num_heads % tp_size == 0` AssertionError | TP 数与头数不整除（见 3.4.1） | 按 3.4 节脚本算出有效 TP，改 `--tp-size` 重启 |
+| `Load weight begin. avail mem` 只有几 GB / 后续 OOM | 旧服务没停，显存被占 | `pkill -f sglang.launch_server`，npu-smi 确认回到 ~29GB 再启动 |
 | 仍然 `k_buffer` AttributeError | 意外（标准模型不该出现） | 检查是不是真的用了 Qwen2.5 路径启动；贴 traceback 排查 |
 | 过了 k_buffer，挂在 `LMCacheMPConnector(...)` 构造（TypeError unexpected kwarg 之类） | 旧接线与 LMCache dev 接口错配 | 留档报错；这是已知交接缝隙，按"本仓 runtime patch 包装构造"评估（见 progress_and_next_action.md 第 4 步决策表） |
 | connector 构造成功但连不上 server（ZMQ/超时/注册失败） | 旧类与新 server 协议不兼容（第 1.3 节预判的残存风险） | 留档最早 traceback；此为路线 A 探路的结果，转入版本匹配评估 |
+| `LMCache chunk size must be a multiple of SGLang page size` | chunk_size 与 page_size 不整除 | 按第 6 步查 page_size，同步改 YAML 和 server 的 `--chunk-size` 后两边重启 |
 | NPU 侧报错（c_ops / IPC / transfer context） | 数据面问题——**这才是 LMCache-Ascend 的管辖范围** | 贴报错，按本仓数据面排查（对照 e2e 测试 test_npu_lmcache_driven_e2e.py 的行为差异） |
 | 输出乱码或语义异常 | KV 回灌正确性问题 | 缩小前缀长度复测；对比关闭 LMCache 的裸服务输出 |
 
