@@ -19,6 +19,17 @@ def _is_vllm_runtime():
     return "vllm" in sys.modules or any("vllm" in arg for arg in sys.argv)
 
 
+def _is_sglang_runtime():
+    """Return True when running inside an SGLang worker/scheduler process.
+
+    Called by the activation block at the bottom of this file. SGLang's
+    scheduler imports lmcache only after sglang itself is fully loaded,
+    so the ``sys.modules`` check is reliable by the time we run; the
+    ``sys.argv`` scan covers CLI entrypoints checked before that.
+    """
+    return "sglang" in sys.modules or any("sglang" in arg for arg in sys.argv)
+
+
 def _seed_partial_lmcache_device_ops() -> None:
     """Bridge ``lmcache.device_ops`` while ``import lmcache`` is still running.
 
@@ -105,6 +116,22 @@ def _patch_make_page_buffer_shape_desc():
     install_plane_geometry_fill()
 
 
+def _patch_sglang_mp_connector_compat():
+    """Adapt the SGLang MP connector to SGLang's stacked k/v pool buffers.
+
+    SGLang's 0.5.2x dev mem_cache refactor exposes ``k_buffer`` /
+    ``v_buffer`` as single stacked tensors; LMCache's
+    ``LMCacheMPConnector`` still expects per-layer ``list[Tensor]`` and
+    dies with "Boolean value of Tensor ... is ambiguous" at construction.
+    """
+    # First Party
+    from lmcache_ascend.integration.sglang.mp_connector_compat import (
+        install_mp_connector_compat,
+    )
+
+    install_mp_connector_compat()
+
+
 # Check if we've already patched to avoid redundant work
 if not LMCACHE_ASCEND_PATCHED:
     # Must run before any patch: the activation imports core modules that
@@ -115,6 +142,21 @@ if not LMCACHE_ASCEND_PATCHED:
 
     if _is_vllm_runtime():
         _patch_logical_block_size()
+
+    if _is_sglang_runtime():
+        # Failures here (e.g. lmcache's own sglang integration module not
+        # importable in this version) must never abort the whole plugin
+        # activation: the connector keeps upstream behavior and the shape
+        # mismatch resurfaces as the original construction error.
+        try:
+            _patch_sglang_mp_connector_compat()
+        except Exception as exc:  # noqa: BLE001
+            # Third Party
+            from lmcache.logging import init_logger
+
+            init_logger(__name__).warning(
+                "SGLang MP connector compat patch not installed: %s", exc
+            )
 
     _patch_make_page_buffer_shape_desc()
 
