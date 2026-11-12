@@ -449,7 +449,20 @@ python -c "import lmcache_ascend; print(lmcache_ascend.__file__)"
 #    docker cp __init__.py <容器>:/workspace/src/LMCache-Ascend/lmcache_ascend/integration/sglang/
 #    docker cp __init__.py <容器>:/workspace/src/LMCache-Ascend/lmcache_ascend/   # 注意两个 __init__.py 路径不同
 
-# 2) 重启 SGLang（lmcache server 不用动）
+# 2) 清字节码（旧 .pyc 会让改动"看起来没生效"，最常见假坑）
+find lmcache_ascend -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null
+
+# 3) 30 秒快速验证（不用起服务）：补丁可导入、可安装、标记可打上
+python - <<'PY'
+import lmcache
+from lmcache_ascend.integration.sglang.mp_connector_compat import install_mp_connector_compat
+install_mp_connector_compat()
+import lmcache.integration.sglang.multi_process_adapter as mpa
+print("patch importable and installable:",
+      getattr(mpa.LMCacheMPConnector.__init__, "_lmcache_ascend_mp_compat", False))
+PY
+
+# 4) 重启 SGLang（lmcache server 不用动）
 ```
 
 重启后验证补丁生效的两条日志（SGLang 启动日志里 grep）：
@@ -471,14 +484,12 @@ grep -E "Installed SGLang MP connector|stacked k_pool buffer|stacked v_pool buff
 
 ## 9. 成功之后做什么
 
-1. **记录基线**：同前缀冷/热请求各测 5 次，记录 TTFT（响应里 usage 或加时间戳），
-   与裸 SGLang（无 LMCache）对比——这是后续 A/B 报告的第一组数据。
+1. **第 11 节**：交互问答（直接对模型提问题看回答）与 benchmark 测试。
 2. **回归 Qwen3.8 hybrid 专项**：标准模型跑通证明"管线 + 数据面"没问题后，
    hybrid 的问题就纯粹集中在 SGLang 旧接线对 HybridLinearKVPool 的支持上——
    那是独立的一块适配工作（注入 k_buffer property 或切新接线），见
    [progress_and_next_action.md](progress_and_next_action.md) 第 4 步。
-3. **更新文档**：把本教程的实测结果（page_size 实际值、是否踩到 1.3 节风险）
-   回填到本文档末尾的"实测记录"小节。
+3. **更新文档**：把本教程的实测结果回填到本文档末尾的"实测记录"小节。
 
 ## 10. 与既有文档的关系
 
@@ -494,11 +505,246 @@ grep -E "Installed SGLang MP connector|stacked k_pool buffer|stacked v_pool buff
 ## 实测记录（跑完后回填）
 
 ```text
-日期：
-page_size 实测值：
-chunk_size 最终值：
-1.3 节残存风险是否触发（旧 connector ↔ 新 server）：
-Stored / Retrieved 日志摘录：
+日期：2026-11-12（启动成功，验证进行中）
+TP：4（NPU 0~3，每卡 sglangschedul ~26.5GB；卡 4~7 空闲）
+page_size 实测值：128（由 k_pool 形状 (28, 12203, 128, 1, 128) 的 bs 维证实；
+                     12203×128=1,561,984 tokens 与 KV 分配日志一致）
+chunk_size 最终值：256（256 % 128 == 0，connector 对齐自检通过）
+1.3 节残存风险是否触发：触发——表现为 "Boolean value of Tensor ... is ambiguous"，
+                     已由本仓补丁解决（见 8.1），connector 构造成功、心跳已启动
+Stored / Retrieved 日志摘录：（待 7.2 长前缀三连后回填）
 TTFT 对比（裸 vs LMCache）：
-遗留问题：
+遗留问题：NPU 4~7 各有 2853MB 无主显存（疑似早期崩溃运行的残留上下文，
+         不影响当前验证；需要用这 4 张卡时重启容器清理）
 ```
+
+### 如何确认本仓（LMCache-Ascend）在起作用——三层证据检查表
+
+| 层 | 证据 | 在哪看 | 状态 |
+|---|---|---|---|
+| 1. 插件在 SGLang 进程执行 | `Installed SGLang MP connector stacked-KV compat patch`、`split into 28 per-layer views`（logger 名含 `lmcache_ascend.integration.sglang.mp_connector_compat`） | SGLang 启动日志 | ✅ 已证实 |
+| 2. NPU 数据面在 server 侧激活 | `lmcache` 进程在 NPU 0~3 各持 ~148MB（导入 IPC 句柄 + cache context）；`Tree cache initialized: impl=LMCRadixCache` × 4 | npu-smi + SGLang 日志 | ✅ 已证实 |
+| 3. 真实 KV 搬运 | `Engine KV Format:`（server 识别布局）+ `Stored ... tokens` / `Retrieved ... tokens`（含毫秒级耗时） | server 日志，跑完 7.2 后 grep | ⬜ 待验证 |
+
+验证命令：
+
+```bash
+grep -iE "Engine KV Format|lmcache_ascend" /workspace/results/lmcache_server_qwen25.log | head -20
+grep -E "Stored|Retrieved" /workspace/results/lmcache_server_qwen25.log | tail -20
+```
+
+注意：短请求（token 数 < chunk_size=256）不会触发 Stored——必须用 7.1 的长前缀请求。
+
+---
+
+## 11. 交互问答与 Benchmark 测试
+
+### 11.1 交互问答（直接跟模型对话）
+
+#### 方式一：curl 一问一答（最快）
+
+```bash
+curl -s http://127.0.0.1:8998/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen2.5-7B-Instruct",
+    "messages": [{"role": "user", "content": "用三句话介绍一下KV缓存的作用"}],
+    "max_tokens": 256,
+    "temperature": 0.7
+  }' | python -m json.tool
+```
+
+回答在 `.choices[0].message.content`。中文问题直接问即可，模型是 Instruct 版。
+
+#### 方式二：python 交互脚本（推荐日常使用，可连续对话）
+
+```bash
+mkdir -p /workspace/scripts
+cat > /workspace/scripts/chat.py <<'PY'
+#!/usr/bin/env python
+"""简单的 SGLang 交互问答客户端：python chat.py [模型名]"""
+import json, sys, urllib.request
+
+BASE = "http://127.0.0.1:8998"
+MODEL = sys.argv[1] if len(sys.argv) > 1 else "Qwen2.5-7B-Instruct"
+
+def chat(messages, **kw):
+    payload = {"model": MODEL, "messages": messages, "temperature": 0.7, **kw}
+    req = urllib.request.Request(
+        BASE + "/v1/chat/completions",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=300) as r:
+        body = json.loads(r.read())
+    msg = body["choices"][0]["message"]
+    usage = body.get("usage", {})
+    ttft_hint = usage.get("prompt_tokens", "?")
+    return msg["content"], ttft_hint
+
+history = []
+print(f"已连接 {BASE}，模型 {MODEL}。输入 exit 退出，new 清空多轮历史。\n")
+while True:
+    try:
+        user = input("你: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print(); break
+    if not user: continue
+    if user == "exit": break
+    if user == "new":
+        history.clear(); print("（历史已清空）\n"); continue
+    history.append({"role": "user", "content": user})
+    answer, ptok = chat(history, max_tokens=1024)
+    history.append({"role": "assistant", "content": answer})
+    print(f"模型(prompt {ptok} tok): {answer}\n")
+PY
+
+# 用法
+python /workspace/scripts/chat.py
+# 交互中：
+#   你: 你好，请自我介绍
+#   你: 我刚才问了你什么？        ← 多轮上下文测试
+#   你: new                        ← 清历史
+```
+
+多轮对话正是 LMCache 的目标场景（前缀复用）——第二轮请求会带着第一轮全部内容，
+前缀命中时 TTFT 应明显低于第一轮。
+
+#### 方式三：观察问答触发的缓存行为（问答 + 验证二合一）
+
+```bash
+# 问一个长问题（把 7.1 的长前缀当背景知识塞进去）
+python - <<'PY'
+import json, urllib.request
+prefix = "以下是关于分布式KV缓存系统的一次内部技术评审记录，涉及内存池分层与传输通道选型。" * 120
+payload = {
+    "model": "Qwen2.5-7B-Instruct",
+    "messages": [{"role": "user",
+                  "content": prefix + "\n\n基于以上材料，评审结论的核心风险是什么？用两句话回答。"}],
+    "max_tokens": 128, "temperature": 0,
+}
+req = urllib.request.Request("http://127.0.0.1:8998/v1/chat/completions",
+    data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
+with urllib.request.urlopen(req, timeout=300) as r:
+    print(json.loads(r.read())["choices"][0]["message"]["content"])
+PY
+# 然后看 server 日志的 Stored / Retrieved（7.2 的 ④ 步）
+```
+
+### 11.2 Benchmark 测试
+
+#### 基准一：单请求 TTFT 对比（LMCache 收益的直接证据，最先做这个）
+
+```bash
+cat > /workspace/scripts/bench_ttft.py <<'PY'
+#!/usr/bin/env python
+"""单请求 TTFT 对比：冷（无缓存）vs 热（LMCache 命中）。
+用法: python bench_ttft.py [重复次数，默认5]"""
+import json, sys, time, urllib.request
+
+BASE, MODEL = "http://127.0.0.1:8998", "Qwen2.5-7B-Instruct"
+REPEAT = int(sys.argv[1]) if len(sys.argv) > 1 else 5
+prefix = "以下是关于分布式KV缓存系统的一次内部技术评审记录，涉及内存池分层与传输通道选型。" * 120
+prompt = prefix + "\n\n请用一句话总结上面的内容。"
+
+def one_request(stream=True):
+    payload = {"model": MODEL, "messages": [{"role": "user", "content": prompt}],
+               "max_tokens": 32, "temperature": 0, "stream": stream}
+    req = urllib.request.Request(BASE + "/v1/chat/completions",
+        data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
+    t0 = time.perf_counter()
+    ttft, total = None, t0
+    with urllib.request.urlopen(req, timeout=300) as r:
+        if stream:  # 从流式响应抓首 token 时间
+            for line in r:
+                if line.startswith(b"data:") and b'"content"' in line:
+                    ttft = time.perf_counter() - t0
+                    break
+            total = time.perf_counter() - t0
+        else:
+            json.loads(r.read()); total = time.perf_counter() - t0
+    return ttft, total
+
+def flush():
+    urllib.request.urlopen(urllib.request.Request(
+        BASE + "/flush_cache", method="POST"), timeout=60).read()
+
+print(f"prompt chars={len(prompt)}, repeat={REPEAT}")
+for label, do_flush in [("冷(无缓存)", True), ("热(LMCache命中)", False)]:
+    times = []
+    for i in range(REPEAT):
+        if do_flush: flush()
+        ttft, total = one_request(stream=True)
+        times.append((ttft, total))
+        print(f"  [{label}] #{i+1}: TTFT={ttft and f'{ttft:.3f}s'} total={total:.3f}s")
+    avg_t = sum(t for t, _ in times if t) / max(1, sum(1 for t, _ in times if t))
+    print(f"  [{label}] 平均 TTFT: {avg_t:.3f}s\n")
+PY
+python /workspace/scripts/bench_ttft.py 5 | tee /workspace/results/bench_ttft.log
+```
+
+**读数方法**：热组平均 TTFT 应显著低于冷组（前缀越长差距越大）。
+首次冷请求后 server 日志出现 `Stored`，热请求出现 `Retrieved`——
+TTFT 差值 + 这两条日志 = LMCache 生效的完整证据链。
+
+#### 基准二：并发压力测试（sglang 自带 bench_serving）
+
+容器里 SGLang 自带压测工具（注意：用 `sglang.benchmark.serving` 新入口，
+旧 `bench_serving` 入口已废弃）：
+
+```bash
+# 前置：离线环境必须用本地语料（禁止在线下载）。
+# 若之前 Qwen3.8 基线阶段已准备过 ShareGPT 语料，直接复用其路径；
+# 若没有，用长文本自造一份：
+python - <<'PY'
+import json, random
+random.seed(42)
+words = ["缓存", "传输", "内存池", "调度", "队列", "张量", "算子", "通道", "页表", "命中率"]
+doc = {"conversations": []}
+for i in range(200):
+    turns = []
+    for r in range(random.randint(2, 5)):
+        turns.append({"from": "human",
+                      "value": " ".join(random.choices(words, k=random.randint(400, 900))) +
+                               f" （问题{i}第{r}轮）请总结上述内容。"})
+        turns.append({"from": "gpt", "value": "好的，这是总结。"})
+    doc["conversations"].append(turns)
+json.dump(doc, open("/workspace/scripts/local_corpus.json", "w"), ensure_ascii=False)
+print("corpus ok:", len(doc["conversations"]), "conversations")
+PY
+
+# 压测（本地语料版，1/4 并发起步观察稳定性，再上 32/64）
+python -m sglang.benchmark.serving \
+  --backend sglang \
+  --host 127.0.0.1 --port 8998 \
+  --model-name Qwen2.5-7B-Instruct \
+  --dataset-name sharegpt \
+  --dataset-path /workspace/scripts/local_corpus.json \
+  --num-prompts 32 --request-rate 4 \
+  --output-file /workspace/results/bench_sharegpt.json \
+  2>&1 | tee /workspace/results/bench_sharegpt.log
+```
+
+关注指标：`median TTFT (ms)`、`median ITL (ms)`、`Output token throughput (tok/s)`、
+`Request throughput (req/s)`。离线环境务必带 `--dataset-path`，
+否则脚本会静默回退到 HuggingFace 下载并抛离线异常（已知坑）。
+
+#### A/B 对照（完整报告用）
+
+| 组 | 配置 | 测什么 |
+|---|---|---|
+| A 裸 SGLang | 去掉 `--enable-lmcache --lmcache-config-file` 重启，其余参数不变 | 基线 |
+| B SGLang + LMCache MP | 当前服务 | 增益 |
+
+两组各跑一遍基准一 + 基准二，同 seed 同语料同并发度，结果填入"实测记录"。
+
+### 11.3 benchmark 注意事项
+
+| 事项 | 原因 |
+|---|---|
+| 每轮"冷"测量前必须 `flush_cache` | SGLang 本地 RadixCache 会让第二次请求秒回，测的不是 LMCache |
+| `--request-rate` 从小值起步（4 或 8） | NPU graph/调度在高压下先崩的是稳定性而不是性能数据 |
+| 多轮压测之间间隔 30s | 让 heartbeat/后台线程稳定，避免上一轮的存储还没落完 |
+| 报告里同时给 TTFT 和吞吐 | LMCache 的收益主要在 TTFT（前缀命中），吞吐变化不大是正常的 |
+| 压测期间另开终端盯 server 日志 | `Stored/Retrieved` 频次 = 缓存参与度的直接证据 |
+| 离线语料必须是合法 JSON 的 ShareGPT 格式 | 否则 benchmark 静默回退 HF 下载并抛离线异常 |
