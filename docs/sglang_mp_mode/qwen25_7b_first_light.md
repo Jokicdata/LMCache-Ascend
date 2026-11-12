@@ -417,6 +417,7 @@ grep -E "Stored|Retrieved" /workspace/results/lmcache_server_qwen25.log | tail -
 | `Load weight begin. avail mem` 只有几 GB / 后续 OOM | 旧服务没停，显存被占 | `pkill -f sglang.launch_server`，npu-smi 确认回到 ~29GB 再启动 |
 | 仍然 `k_buffer` AttributeError | 意外（标准模型不该出现） | 检查是不是真的用了 Qwen2.5 路径启动；贴 traceback 排查 |
 | 过了 k_buffer，挂在 `LMCacheMPConnector(...)` 构造（TypeError unexpected kwarg 之类） | 旧接线与 LMCache dev 接口错配 | 留档报错；这是已知交接缝隙，按"本仓 runtime patch 包装构造"评估（见 progress_and_next_action.md 第 4 步决策表） |
+| `LMCacheMPConnector` 构造中 `RuntimeError: Boolean value of Tensor with more than one value is ambiguous`（`_validate_sglang_kv_pools` 处，2026-11-12 实测） | 新版 SGLang 重构后 `k_buffer`/`v_buffer` 是**单张量**（逐层堆叠成一块），旧连接器期望**逐层 list[Tensor]**——`if not k_pool` 对大张量求布尔值必然歧义。与 NPU 无关，CUDA 上同样会挂 | ✅ **本仓补丁已实现**：`lmcache_ascend/integration/sglang/mp_connector_compat.py`（构造包装，堆叠张量→逐层零拷贝视图），由 `lmcache_ascend/__init__.py` 在 SGLang 运行时自动安装。部署见下方 8.1 |
 | connector 构造成功但连不上 server（ZMQ/超时/注册失败） | 旧类与新 server 协议不兼容（第 1.3 节预判的残存风险） | 留档最早 traceback；此为路线 A 探路的结果，转入版本匹配评估 |
 | `LMCache chunk size must be a multiple of SGLang page size` | chunk_size 与 page_size 不整除 | 按第 6 步查 page_size，同步改 YAML 和 server 的 `--chunk-size` 后两边重启 |
 | NPU 侧报错（c_ops / IPC / transfer context） | 数据面问题——**这才是 LMCache-Ascend 的管辖范围** | 贴报错，按本仓数据面排查（对照 e2e 测试 test_npu_lmcache_driven_e2e.py 的行为差异） |
@@ -424,6 +425,47 @@ grep -E "Stored|Retrieved" /workspace/results/lmcache_server_qwen25.log | tail -
 
 通用要求：任何失败都保留**最早一条完整 traceback**（不是最后 worker 退出的部分），
 并 `tee` 留档到 `/workspace/results/`。
+
+### 8.1 堆叠 KV 兼容补丁的部署（纯 Python，无需重编译 c_ops）
+
+补丁涉及 3 个文件（本仓 `lmcache_ascend/` 下）：
+
+| 文件 | 说明 |
+|---|---|
+| `integration/sglang/__init__.py` | 新增（包初始化） |
+| `integration/sglang/mp_connector_compat.py` | 新增（构造包装：堆叠张量→逐层零拷贝视图） |
+| `__init__.py` | 修改（新增 `_is_sglang_runtime` + 激活段 sglang 分支，带异常守卫） |
+
+部署步骤（容器内执行）：
+
+```bash
+# 0) 先确认 lmcache_ascend 是哪种安装方式，决定改哪里生效
+python -c "import lmcache_ascend; print(lmcache_ascend.__file__)"
+#   输出 /workspace/src/LMCache-Ascend/...  → 可编辑安装，改源码即生效
+#   输出 site-packages/...                  → 常规安装，需 docker cp 到对应目录（或重装）
+
+# 1) 把 3 个文件同步进容器仓库（git pull / docker cp 均可），以 docker cp 为例：
+#    docker cp mp_connector_compat.py <容器>:/workspace/src/LMCache-Ascend/lmcache_ascend/integration/sglang/
+#    docker cp __init__.py <容器>:/workspace/src/LMCache-Ascend/lmcache_ascend/integration/sglang/
+#    docker cp __init__.py <容器>:/workspace/src/LMCache-Ascend/lmcache_ascend/   # 注意两个 __init__.py 路径不同
+
+# 2) 重启 SGLang（lmcache server 不用动）
+```
+
+重启后验证补丁生效的两条日志（SGLang 启动日志里 grep）：
+
+```bash
+grep -E "Installed SGLang MP connector|stacked k_pool buffer|stacked v_pool buffer" \
+  /workspace/results/sglang_mp_qwen25.log
+# 预期：
+#   Installed SGLang MP connector stacked-KV compat patch   ← 补丁装上（每个 scheduler 进程一条）
+#   SGLang stacked k_pool buffer shape=(28, ...) ... split into 28 per-layer views  ← 拆分发生
+#   SGLang stacked v_pool buffer shape=(28, ...) ... split into 28 per-layer views
+# shape[0]=28 即层数（Qwen2.5-7B），可同时确认堆叠顺序是"层在前"
+```
+
+若出现 `SGLang MP connector compat patch not installed: ...` 的 warning，
+说明激活期导入失败（半初始化顺序问题）——把 warning 内容贴出来单独处理。
 
 ---
 

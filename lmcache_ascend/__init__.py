@@ -28,6 +28,18 @@ def _is_vllm_runtime():
     return "vllm" in sys.modules or any("vllm" in arg for arg in sys.argv)
 
 
+def _is_sglang_runtime():
+    """判断当前进程是否处于 SGLang 运行时。
+
+    由本文件底部的插件激活逻辑调用；已加载 ``sglang`` 模块，或命令行
+    参数包含 ``sglang`` 时返回 ``True``，据此决定是否安装 SGLang MP
+    连接器兼容补丁。SGLang 的 scheduler 进程在导入
+    ``lmcache.integration.sglang.multi_process_adapter`` 时会先触发
+    ``import lmcache``（进而激活本插件），此时 ``sglang`` 早已完整加载。
+    """
+    return "sglang" in sys.modules or any("sglang" in arg for arg in sys.argv)
+
+
 def _seed_partial_lmcache_device_ops() -> None:
     """Bridge ``lmcache.device_ops`` while ``import lmcache`` is still running.
 
@@ -171,6 +183,29 @@ def _patch_make_page_buffer_shape_desc():
     install_plane_geometry_fill()
 
 
+def _patch_sglang_mp_connector_compat():
+    """Adapt the SGLang MP connector to SGLang's stacked k/v pool buffers.
+
+    SGLang's 0.5.2x dev mem_cache refactor exposes ``k_buffer`` /
+    ``v_buffer`` as single stacked tensors; LMCache's
+    ``LMCacheMPConnector`` still expects per-layer ``list[Tensor]`` and
+    dies with "Boolean value of Tensor ... is ambiguous" at construction.
+
+    将 SGLang MP 连接器适配新版 SGLang 的堆叠式 k/v 池缓冲。
+
+    本函数由模块导入激活逻辑在 SGLang 运行时调用，并委托
+    ``mp_connector_compat.install_mp_connector_compat`` 包装连接器构造，
+    把堆叠张量按层拆成视图列表后转交原构造函数（零拷贝）。
+    """
+    # First Party
+    # 本项目模块
+    from lmcache_ascend.integration.sglang.mp_connector_compat import (
+        install_mp_connector_compat,
+    )
+
+    install_mp_connector_compat()
+
+
 # Check if we've already patched to avoid redundant work
 # 检查是否已打补丁，避免重复工作。
 if not LMCACHE_ASCEND_PATCHED:
@@ -186,6 +221,25 @@ if not LMCACHE_ASCEND_PATCHED:
 
     if _is_vllm_runtime():
         _patch_logical_block_size()
+
+    if _is_sglang_runtime():
+        # Import failures here (e.g. partial-init ordering of lmcache's own
+        # sglang integration module) must never abort the whole activation:
+        # the connector simply keeps its upstream behavior and the mismatch
+        # resurfaces as the original construction error.
+        # 此处的导入失败（如 lmcache 自身 sglang 集成模块的半初始化顺序
+        # 问题）绝不能中断整个激活流程：连接器仅保持上游行为，形状不
+        # 匹配会以原来的构造错误形式再次暴露。
+        try:
+            _patch_sglang_mp_connector_compat()
+        except Exception as exc:  # noqa: BLE001
+            # Third Party
+            # 第三方依赖
+            from lmcache.logging import init_logger
+
+            init_logger(__name__).warning(
+                "SGLang MP connector compat patch not installed: %s", exc
+            )
 
     _patch_make_page_buffer_shape_desc()
 
