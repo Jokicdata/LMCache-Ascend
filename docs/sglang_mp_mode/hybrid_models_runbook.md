@@ -83,9 +83,12 @@ sleep 10
 npu-smi info | head -40        # 确认 sglangschedul 进程消失、显存回到 ~29GB/卡
 
 # 3.2 启动 Qwen3.8 —— 与你最初基线完全相同的参数 + lmcache 两参数
+#     注意模型路径是 /data/models/Qwen3.8-27B（容器实际目录名，2026-11-13 核实；
+#     写成 /data/models/Qwen 会报 "Repo id must be in the form ..." —— 那是
+#     transformers 找不到本地目录后把路径当 HF 仓库名的报错）
 export PYTHONHASHSEED=0
 python -m sglang.launch_server \
-  --model-path /data/models/Qwen \
+  --model-path /data/models/Qwen3.8-27B \
   --served-model-name Qwen3.8-27B \
   --host 0.0.0.0 --port 8998 \
   --tp-size 8 --dtype bfloat16 \

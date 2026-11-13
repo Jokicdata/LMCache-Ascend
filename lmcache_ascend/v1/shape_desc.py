@@ -130,7 +130,17 @@ def install_plane_geometry_fill() -> None:
     # Third Party
     # 第三方依赖
     import lmcache.lmcache_native as lmcache_native
-    import lmcache.v1.common.utils as common_utils
+
+    # Upstream moved the desc factory from ``lmcache.v1.gpu_connector.utils``
+    # to ``lmcache.v1.common.utils`` during the 0.5.x dev cycle; pick whichever
+    # layout this lmcache build actually ships so the wrap works on both.
+    # 上游在 0.5.x dev 周期把描述符工厂从 ``lmcache.v1.gpu_connector.utils``
+    # 迁到了 ``lmcache.v1.common.utils``；按实际安装的 lmcache 布局二选一，
+    # 使包装在两个版本上都生效。
+    try:
+        import lmcache.v1.common.utils as common_utils
+    except ModuleNotFoundError:
+        import lmcache.v1.gpu_connector.utils as common_utils
 
     original = common_utils.make_page_buffer_shape_desc
     plane_tuple_fmts = (
