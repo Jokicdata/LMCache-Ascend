@@ -402,11 +402,27 @@ class LMCacheAscendUnifiedCache(UnifiedRadixCache):
         # NOTE(v1): SWA / C128 sidecar components are not wired yet;
         # models needing them fall back to FULL-only caching.
         # 注意(v1)：SWA / C128 边车组件尚未接线；需要它们的模型
-        # 暂时退化为仅 FULL 缓存。
+        # 暂时退化为仅为 FULL 缓存。
         params.tree_components = tuple(components)
 
-        UnifiedRadixCache.__init__(instance, params)
+        # Swap the class BEFORE re-initialization: UnifiedRadixCache.__init__
+        # calls ``self.reset()`` mid-way, and method dispatch follows the
+        # instance's *current* class. Leaving the old LMCRadixCache class in
+        # place until after init routed that reset into the legacy
+        # implementation, which touches RadixCache attributes this instance
+        # never received (AttributeError: evictable_leaves). With the swap
+        # first, reset() dispatches to UnifiedRadixCache.reset, which only
+        # needs attributes the init has already set; our own reset override
+        # tolerates the missing driver via its getattr-None default.
+        # 先换类再重新初始化：UnifiedRadixCache.__init__ 中途会调用
+        # ``self.reset()``，而方法分派跟随实例"当前"的类。若换类放在
+        # init 之后，该 reset 会被分派到旧 LMCRadixCache 实现，访问本
+        # 实例从未获得的 RadixCache 属性（AttributeError:
+        # evictable_leaves）。先换类后，reset() 分派到
+        # UnifiedRadixCache.reset——它只依赖 init 此前已设置的属性；
+        # 我们的 reset 覆写通过 getattr-None 默认值容忍 driver 缺席。
         instance.__class__ = cls
+        UnifiedRadixCache.__init__(instance, params)
         instance._lmc_has_mamba = has_mamba
         instance._lmc_driver = LMCacheMPDriver(
             instance,
