@@ -206,6 +206,35 @@ def _patch_sglang_mp_connector_compat():
     install_mp_connector_compat()
 
 
+def _patch_sglang_unified_diversion():
+    """Divert LMCRadixCache onto the unified path for hybrid/MLA/DSV4 pools.
+
+    Installs a ``RadixCache.__init_subclass__`` hook while SGLang's
+    ``lmc_radix_cache`` module is still being imported, so the
+    ``class LMCRadixCache(RadixCache):`` statement gets a dispatching
+    ``__init__``: standard pools keep the verified legacy path, while
+    hybrid (Qwen3.8 / GLM-5.3), MLA and DeepSeek-V4 pools re-initialize
+    as ``LMCacheAscendUnifiedCache`` driving LMCache's unified MP
+    connector.
+
+    对 hybrid/MLA/DSV4 池把 LMCRadixCache 分流到统一路径。
+
+    在 SGLang 的 ``lmc_radix_cache`` 模块仍在导入期间安装
+    ``RadixCache.__init_subclass__`` 钩子，使 ``class LMCRadixCache
+    (RadixCache):`` 语句获得一个分派式 ``__init__``：标准池保持已验证
+    的旧路径；hybrid（Qwen3.8 / GLM-5.3）、MLA、DeepSeek-V4 池则重新
+    初始化为驱动 LMCache 统一 MP 连接器的
+    ``LMCacheAscendUnifiedCache``。
+    """
+    # First Party
+    # 本项目模块
+    from lmcache_ascend.integration.sglang.unified_diversion import (
+        install_unified_diversion,
+    )
+
+    install_unified_diversion()
+
+
 # Check if we've already patched to avoid redundant work
 # 检查是否已打补丁，避免重复工作。
 if not LMCACHE_ASCEND_PATCHED:
@@ -226,20 +255,26 @@ if not LMCACHE_ASCEND_PATCHED:
         # Import failures here (e.g. partial-init ordering of lmcache's own
         # sglang integration module) must never abort the whole activation:
         # the connector simply keeps its upstream behavior and the mismatch
-        # resurfaces as the original construction error.
+        # resurfaces as the original construction error. Each patch is
+        # guarded separately so one failing never disables the other.
         # 此处的导入失败（如 lmcache 自身 sglang 集成模块的半初始化顺序
         # 问题）绝不能中断整个激活流程：连接器仅保持上游行为，形状不
-        # 匹配会以原来的构造错误形式再次暴露。
-        try:
-            _patch_sglang_mp_connector_compat()
-        except Exception as exc:  # noqa: BLE001
-            # Third Party
-            # 第三方依赖
-            from lmcache.logging import init_logger
+        # 匹配会以原来的构造错误形式再次暴露。两个补丁分别守卫，
+        # 一个失败不拖累另一个。
+        # Third Party
+        # 第三方依赖
+        from lmcache.logging import init_logger
 
-            init_logger(__name__).warning(
-                "SGLang MP connector compat patch not installed: %s", exc
-            )
+        for _patch in (
+            _patch_sglang_mp_connector_compat,
+            _patch_sglang_unified_diversion,
+        ):
+            try:
+                _patch()
+            except Exception as exc:  # noqa: BLE001
+                init_logger(__name__).warning(
+                    "%s not installed: %s", _patch.__name__, exc
+                )
 
     _patch_make_page_buffer_shape_desc()
 
