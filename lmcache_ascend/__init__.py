@@ -132,6 +132,25 @@ def _patch_sglang_mp_connector_compat():
     install_mp_connector_compat()
 
 
+def _patch_sglang_unified_diversion():
+    """Divert LMCRadixCache onto the unified path for hybrid/MLA/DSV4 pools.
+
+    Installs a ``RadixCache.__init_subclass__`` hook while SGLang's
+    ``lmc_radix_cache`` module is still being imported, so the
+    ``class LMCRadixCache(RadixCache):`` statement gets a dispatching
+    ``__init__``: standard pools keep the verified legacy path, while
+    hybrid (Qwen3.8 / GLM-5.3), MLA and DeepSeek-V4 pools re-initialize
+    as ``LMCacheAscendUnifiedCache`` driving LMCache's unified MP
+    connector.
+    """
+    # First Party
+    from lmcache_ascend.integration.sglang.unified_diversion import (
+        install_unified_diversion,
+    )
+
+    install_unified_diversion()
+
+
 # Check if we've already patched to avoid redundant work
 if not LMCACHE_ASCEND_PATCHED:
     # Must run before any patch: the activation imports core modules that
@@ -144,19 +163,24 @@ if not LMCACHE_ASCEND_PATCHED:
         _patch_logical_block_size()
 
     if _is_sglang_runtime():
-        # Failures here (e.g. lmcache's own sglang integration module not
-        # importable in this version) must never abort the whole plugin
-        # activation: the connector keeps upstream behavior and the shape
-        # mismatch resurfaces as the original construction error.
-        try:
-            _patch_sglang_mp_connector_compat()
-        except Exception as exc:  # noqa: BLE001
-            # Third Party
-            from lmcache.logging import init_logger
+        # Failures here (e.g. partial-init ordering of lmcache's own
+        # sglang integration module) must never abort the whole activation:
+        # the connector simply keeps its upstream behavior and the mismatch
+        # resurfaces as the original construction error. Each patch is
+        # guarded separately so one failing never disables the other.
+        # Third Party
+        from lmcache.logging import init_logger
 
-            init_logger(__name__).warning(
-                "SGLang MP connector compat patch not installed: %s", exc
-            )
+        for _patch in (
+            _patch_sglang_mp_connector_compat,
+            _patch_sglang_unified_diversion,
+        ):
+            try:
+                _patch()
+            except Exception as exc:  # noqa: BLE001
+                init_logger(__name__).warning(
+                    "%s not installed: %s", _patch.__name__, exc
+                )
 
     _patch_make_page_buffer_shape_desc()
 

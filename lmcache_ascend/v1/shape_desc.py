@@ -79,7 +79,14 @@ def install_plane_geometry_fill() -> None:
     """
     # Third Party
     import lmcache.lmcache_native as lmcache_native
-    import lmcache.v1.common.utils as common_utils
+
+    # Upstream moved the desc factory from ``lmcache.v1.gpu_connector.utils``
+    # to ``lmcache.v1.common.utils`` during the 0.5.x dev cycle; pick whichever
+    # layout this lmcache build actually ships so the wrap works on both.
+    try:
+        import lmcache.v1.common.utils as common_utils
+    except ModuleNotFoundError:
+        import lmcache.v1.gpu_connector.utils as common_utils
 
     original = common_utils.make_page_buffer_shape_desc
     plane_tuple_fmts = (
