@@ -75,6 +75,70 @@ def _split_stacked_pool(pool: object, name: str) -> object:
     return layers
 
 
+def _fold_page_native_pool(kv_pool: object) -> None:
+    """Fold a page-native NPU pool's per-layer buffers to slot-native rows.
+
+    SGLang's NPU memory pools allocate each layer as
+    ``[pages, page_size, heads, dim]`` where dim 0 counts *pages* (plus
+    one padding sentinel page), while LMCache's unified connector treats
+    dim 0 as *token slots* and requires ``rows % slots_per_block == 0``
+    with ``slots_per_block == page_size``.
+
+    Each already-split per-layer buffer is re-viewed as
+    ``[pages * page_size, heads, dim]`` -- a zero-copy reshape of the
+    same storage that satisfies the connector's divisibility contract
+    (every page contributes exactly ``page_size`` rows, so the sentinel
+    page needs no truncation). The connector later re-folds these rows
+    back into blocks via ``_to_wire_block_tensor(slots_per_block=
+    page_size)``, and page 0 keeps SGLang's padding-sink semantics that
+    the store path already handles (``allow_dummy_page``). Buffers that
+    are not 4-D page-native (already slot-native, or mamba state) pass
+    through.
+
+    把 page-native NPU 池的逐层缓冲折叠为 slot-native 行。
+
+    SGLang 的 NPU 内存池把每层分配为 ``[页数, page_size, 头数, 维度]``，
+    第 0 维计数的是"页"；而 LMCache 统一连接器把第 0 维当"token 槽"，
+    并要求 ``行数 % slots_per_block == 0`` 且 ``slots_per_block ==
+    page_size``。
+
+    对已拆分的每个逐层缓冲重视图为 ``[页数 * page_size, 头数, 维度]``
+    ——同一存储的零拷贝 reshape，满足整除契约（每页恰好贡献
+    ``page_size`` 行，哨兵页无需截断）。连接器随后经
+    ``_to_wire_block_tensor(slots_per_block=page_size)`` 把这些行重折回
+    block，页 0 保持 SGLang 的 padding-sink 语义（存储路径已通过
+    ``allow_dummy_page`` 处理）。非 4-D page-native 的缓冲（已是
+    slot-native、或 mamba 状态）原样通过。
+    """
+    # Third Party
+    # 第三方依赖
+    import torch as _torch
+
+    page_size = getattr(kv_pool, "page_size", None)
+    if not page_size or page_size <= 1:
+        return
+    for attr in ("k_buffer", "v_buffer"):
+        buffer = getattr(kv_pool, attr, None)
+        if not isinstance(buffer, list):
+            continue
+        folded = []
+        for layer in buffer:
+            if (
+                isinstance(layer, _torch.Tensor)
+                and layer.dim() == 4
+                and layer.shape[1] == page_size
+            ):
+                rows = layer.shape[0] * page_size
+                folded.append(layer.reshape(rows, layer.shape[2], layer.shape[3]))
+            else:
+                folded.append(layer)
+        setattr(kv_pool, attr, folded)
+    logger.info(
+        "SGLang page-native pool folded to slot-native rows (page_size=%d)",
+        page_size,
+    )
+
+
 def install_mp_connector_compat() -> None:
     """Wrap ``LMCacheMPConnector.__init__`` (idempotent, kwargs-based).
 
@@ -150,6 +214,25 @@ def install_mp_connector_compat() -> None:
                     kv_pool.k_buffer = _split_stacked_pool(k_buffer, "k_buffer")
                 if isinstance(v_buffer, torch.Tensor) and v_buffer.dim() >= 2:
                     kv_pool.v_buffer = _split_stacked_pool(v_buffer, "v_buffer")
+                # Page-native -> slot-native fold. SGLang's NPU pools keep
+                # each layer as ``[pages, page_size, H, D]`` (rows are
+                # *pages*), while the unified connector's contract is
+                # slot-native (rows are *tokens*, rows_per_block ==
+                # slots_per_block == page_size). Folding each per-layer
+                # view to ``[pages * page_size, H, D]`` -- truncating the
+                # padding sentinel page so the row count divides evenly --
+                # makes the geometry self-consistent: the group reports
+                # ``tensor_rows_per_block = (page_size,) * n_tensors``,
+                # and ``4757 pages`` becomes ``4756*128`` slot rows.
+                # Page-native -> slot-native 折叠。SGLang 的 NPU 池把每层
+                # 存成 ``[pages, page_size, H, D]``（行是"页"），而统一
+                # 连接器的契约是 slot-native（行是"槽"，rows_per_block ==
+                # slots_per_block == page_size）。把每个逐层视图折叠成
+                # ``[pages * page_size, H, D]``——截掉 padding 哨兵页使行
+                # 数整除——几何即自洽：组上报
+                # ``tensor_rows_per_block = (page_size,) * n_tensors``，
+                # ``4757 页`` 变为 ``4756*128`` 个槽行。
+                _fold_page_native_pool(kv_pool)
                 try:
                     return original_resolve(self, kv_pool)
                 finally:
