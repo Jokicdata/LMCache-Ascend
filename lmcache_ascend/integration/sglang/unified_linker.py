@@ -279,23 +279,35 @@ class LMCacheMPDriver:
         *,
         mamba_value: Optional[torch.Tensor],
         cache_salt: str,
+        mamba_transfer_tokens: Optional[int] = None,
     ) -> None:
         """Persist the finished request's prefix (fire, complete, end).
 
         Called before the tree insert so the request's own device slots
         (incl. its live Mamba state slot) are still valid for the DMA.
-        Fail-open: errors never propagate into the serving loop.
+        ``mamba_transfer_tokens`` must be a multiple of the Mamba
+        checkpoint grid; pass the chunk-aligned prefix length so both
+        the chunk and grid divisibility contracts hold (0 for requests
+        shorter than one chunk -- an empty checkpoint-slot array is
+        legal and submit_store no-ops there anyway). Fail-open: errors
+        never propagate into the serving loop.
 
         持久化已完成请求的前缀（提交、完成、结束会话）。
 
         在树插入之前调用，使请求自身的设备槽位（含其活跃 Mamba 状态
-        槽）在 DMA 时仍然有效。失败开放：错误不会传入服务循环。
+        槽）在 DMA 时仍然有效。``mamba_transfer_tokens`` 必须是 Mamba
+        检查点网格的整数倍；传 chunk 对齐的前缀长度即可同时满足
+        chunk 与网格两个整除契约（不足一个 chunk 的请求传 0——空
+        检查点槽数组合法，且 submit_store 在该情形本就空操作）。
+        失败开放：错误不会传入服务循环。
         """
         if not self.enabled:
             return
         try:
             group_indices = self.connector.device_indices_by_group(
-                full_device_indices, mamba_value=mamba_value
+                full_device_indices,
+                mamba_value=mamba_value,
+                mamba_transfer_tokens=mamba_transfer_tokens,
             )
             operation = self.connector.submit_store(
                 rid,
@@ -646,16 +658,42 @@ class LMCacheAscendUnifiedCache(UnifiedRadixCache):
         if not tokens or full_indices is None or int(full_indices.numel()) == 0:
             return
         mamba_value = None
-        if self._lmc_has_mamba and req.kv is not None:
-            slot = getattr(req.kv, "mamba_pool_idx", None)
-            if slot is not None:
-                mamba_value = slot.reshape(-1)
+        mamba_transfer_tokens = None
+        if self._lmc_has_mamba:
+            if req.kv is not None:
+                slot = getattr(req.kv, "mamba_pool_idx", None)
+                if slot is not None:
+                    mamba_value = slot.reshape(-1)
+            # The adapter demands the Mamba transfer range be a multiple
+            # of the checkpoint grid; the chunk-aligned prefix length
+            # satisfies both that and the store path's chunk alignment
+            # (chunk is a grid multiple in every supported config).
+            # Requests shorter than one chunk align to 0: an empty
+            # checkpoint-slot array, and submit_store no-ops there.
+            # adapter 要求 Mamba 传输范围是检查点网格的整数倍；
+            # chunk 对齐的前缀长度同时满足该约束与存储路径的 chunk
+            # 对齐（所有受支持配置中 chunk 都是网格的整数倍）。
+            # 不足一个 chunk 的请求对齐到 0：空检查点槽数组，
+            # submit_store 在该情形为空操作。
+            chunk = int(driver.connector.chunk_size)
+            grid = getattr(
+                getattr(
+                    driver.connector._sglang_kv_adapter, "mamba_component", None
+                ),
+                "mamba_checkpoint_grid",
+                chunk,
+            )
+            aligned = len(tokens) // chunk * chunk
+            if grid and aligned % grid:
+                aligned = aligned // grid * grid
+            mamba_transfer_tokens = aligned
         driver.store(
             req.rid,
             tokens,
             full_indices.to(torch.int64),
             mamba_value=mamba_value,
             cache_salt=_global_cache_salt(),
+            mamba_transfer_tokens=mamba_transfer_tokens,
         )
 
     # ---- lifecycle ----
