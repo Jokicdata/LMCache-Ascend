@@ -112,3 +112,64 @@ def install_mp_connector_compat() -> None:
     setattr(_compat_init, _INIT_PATCHED_FLAG, True)
     connector_cls.__init__ = _compat_init
     logger.info("Installed SGLang MP connector stacked-KV compat patch")
+
+    # The unified path hits the same stacked-buffer assumption one layer
+    # deeper: ``SGLangUnifiedKVAdapter._resolve_pool_tensors`` reads the
+    # hybrid pool's ``full_kv_pool.k_buffer`` / ``.v_buffer`` -- on NPU
+    # these are single stacked tensors ``[L, pages, page, H, D]``, and its
+    # ``if not k_buffer`` list assumption raises the same
+    # Boolean-value-ambiguous RuntimeError. Wrap it with the same
+    # zero-copy per-layer split so both the legacy connector and the
+    # unified adapter accept NPU pools.
+    # 统一路径在更深一层撞上同一个堆叠假设：
+    # ``SGLangUnifiedKVAdapter._resolve_pool_tensors`` 读 hybrid 池的
+    # ``full_kv_pool.k_buffer`` / ``.v_buffer``——NPU 上它们是单张堆叠
+    # 张量 ``[L, pages, page, H, D]``，其 ``if not k_buffer`` 的列表
+    # 假设抛出同款 Boolean 歧义 RuntimeError。用同样的零拷贝逐层
+    # 拆分包装它，使旧连接器与统一 adapter 都接受 NPU 池。
+    try:
+        # Third Party
+        # 第三方依赖
+        import lmcache.integration.sglang.unified_kv_adapter as uka
+
+        adapter_cls = getattr(uka, "SGLangUnifiedKVAdapter", None)
+        if adapter_cls is not None and not getattr(
+            adapter_cls._resolve_pool_tensors, _INIT_PATCHED_FLAG, False
+        ):
+            original_resolve = adapter_cls._resolve_pool_tensors
+
+            def _compat_resolve_pool_tensors(self, kv_pool):
+                k_buffer = getattr(kv_pool, "k_buffer", None)
+                v_buffer = getattr(kv_pool, "v_buffer", None)
+                # Split stacked tensors on the *pool object* before the
+                # original validator runs, so every downstream consumer
+                # in the original method sees per-layer lists.
+                # 在原校验器运行前于 *池对象* 上拆分堆叠张量，
+                # 使原方法内的所有下游消费者都看到逐层列表。
+                if isinstance(k_buffer, torch.Tensor) and k_buffer.dim() >= 2:
+                    kv_pool.k_buffer = _split_stacked_pool(k_buffer, "k_buffer")
+                if isinstance(v_buffer, torch.Tensor) and v_buffer.dim() >= 2:
+                    kv_pool.v_buffer = _split_stacked_pool(v_buffer, "v_buffer")
+                try:
+                    return original_resolve(self, kv_pool)
+                finally:
+                    # The pool keeps the split lists (they are views of
+                    # the same storage), which is also what SGLang's own
+                    # runtime expects for the FIA layout; no restore.
+                    # 池保留拆分后的列表（同一存储的视图）——这也与
+                    # SGLang 运行时对 FIA 布局的期望一致；无需还原。
+                    pass
+
+            _compat_resolve_pool_tensors.__name__ = (
+                "SGLangUnifiedKVAdapter._resolve_pool_tensors"
+            )
+            setattr(_compat_resolve_pool_tensors, _INIT_PATCHED_FLAG, True)
+            adapter_cls._resolve_pool_tensors = _compat_resolve_pool_tensors
+            logger.info(
+                "Installed unified KV adapter stacked-KV compat patch"
+            )
+    except ImportError:
+        # Older lmcache builds without the unified adapter stay on the
+        # legacy path; nothing to wrap.
+        # 没有统一 adapter 的旧版 lmcache 保持旧路径；无需包装。
+        logger.debug("unified_kv_adapter not present; skip adapter wrap")
