@@ -117,12 +117,33 @@ class LMCacheMPDriver:
         # rid -> pending lookup; rid -> 待处理 lookup。
         self._pending: dict[str, _PendingLookup] = {}
 
+        # SGLang hands its ``GroupCoordinator`` wrapper here; the connector
+        # needs a torch ``ProcessGroup`` (it calls ``dist.get_world_size`` /
+        # ``dist.all_reduce`` on it). Prefer the gloo ``cpu_group`` -- the
+        # connector only runs small integer collectives (leader broadcast /
+        # success sync) and explicitly demands a *CPU* group on the TP>1
+        # path. Unwrap ``.device_group`` for callers already passing a bare
+        # coordinator-only handle, and pass through real ProcessGroups.
+        # SGLang 在这里传入其 ``GroupCoordinator`` 包装；连接器需要
+        # torch ``ProcessGroup``（它对其调用 ``dist.get_world_size`` /
+        # ``dist.all_reduce``）。优先取 gloo 的 ``cpu_group``——连接器
+        # 只跑小型整数集合通信（leader 广播 / 成功同步），且 TP>1 路径
+        # 明确要求 *CPU* 组。对只带 coordinator 的调用方解包
+        # ``.device_group``，真正的 ProcessGroup 则原样传递。
+        resolved_group = tp_group
+        if resolved_group is not None and not hasattr(resolved_group, "size"):
+            resolved_group = (
+                getattr(resolved_group, "cpu_group", None)
+                or getattr(resolved_group, "device_group", None)
+                or resolved_group
+            )
+
         self.connector = UnifiedLMCacheMPConnector(
             config_file=config_file,
             model_config=model_config,
             tp_size=tp_size,
             tp_rank=tp_rank,
-            tp_group=tp_group,
+            tp_group=resolved_group,
             page_size=cache.page_size,
             token_to_kv_pool_allocator=cache.token_to_kv_pool_allocator,
             req_to_token_pool=cache.req_to_token_pool,
