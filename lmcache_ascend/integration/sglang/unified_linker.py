@@ -657,6 +657,35 @@ class LMCacheAscendUnifiedCache(UnifiedRadixCache):
         full_indices = getattr(req, "prefix_indices", None)
         if not tokens or full_indices is None or int(full_indices.numel()) == 0:
             return
+        chunk = int(driver.connector.chunk_size)
+        # req.prefix_indices spans the whole finished sequence (prompt +
+        # output), whose length is essentially never block-aligned, while
+        # the connector's _normalize_group_indices requires every group's
+        # indices to form complete physical blocks (FULL: multiples of
+        # page_size) and the stored token range to be chunk-aligned. The
+        # connector already slices the chunk-aligned token range itself;
+        # the caller only has to hand it block-aligned indices that cover
+        # that range. Truncate both sides to the largest common length
+        # that is a multiple of lcm(chunk, page_size).
+        # req.prefix_indices 覆盖完成请求的整段序列（提示词 + 输出），
+        # 其长度几乎不可能是块对齐的；而连接器的
+        # _normalize_group_indices 要求每组的索引构成完整物理块
+        # （FULL 组：page_size 的整数倍），存储的 token 范围需按 chunk
+        # 对齐。连接器内部本就会按 chunk 截取 token 范围，调用方只需
+        # 交给它覆盖该范围且块对齐的索引。这里把两侧一并截断到
+        # lcm(chunk, page_size) 的整数倍长度。
+        page = int(getattr(self, "page_size", 0) or 0)
+        stride = chunk
+        while page > 1 and stride % page:
+            stride += chunk
+        store_len = min(len(tokens), int(full_indices.numel()))
+        store_len -= store_len % stride
+        if store_len <= 0:
+            # Shorter than one transfer stride: nothing to persist.
+            # 不足一个传输步长：无内容可持久化。
+            return
+        tokens = tokens[:store_len]
+        full_indices = full_indices[:store_len]
         mamba_value = None
         mamba_transfer_tokens = None
         if self._lmc_has_mamba:
@@ -665,17 +694,16 @@ class LMCacheAscendUnifiedCache(UnifiedRadixCache):
                 if slot is not None:
                     mamba_value = slot.reshape(-1)
             # The adapter demands the Mamba transfer range be a multiple
-            # of the checkpoint grid; the chunk-aligned prefix length
+            # of the checkpoint grid; the chunk-aligned store length
             # satisfies both that and the store path's chunk alignment
             # (chunk is a grid multiple in every supported config).
             # Requests shorter than one chunk align to 0: an empty
             # checkpoint-slot array, and submit_store no-ops there.
             # adapter 要求 Mamba 传输范围是检查点网格的整数倍；
-            # chunk 对齐的前缀长度同时满足该约束与存储路径的 chunk
+            # chunk 对齐的存储长度同时满足该约束与存储路径的 chunk
             # 对齐（所有受支持配置中 chunk 都是网格的整数倍）。
             # 不足一个 chunk 的请求对齐到 0：空检查点槽数组，
             # submit_store 在该情形为空操作。
-            chunk = int(driver.connector.chunk_size)
             grid = getattr(
                 getattr(
                     driver.connector._sglang_kv_adapter, "mamba_component", None
@@ -683,7 +711,7 @@ class LMCacheAscendUnifiedCache(UnifiedRadixCache):
                 "mamba_checkpoint_grid",
                 chunk,
             )
-            aligned = len(tokens) // chunk * chunk
+            aligned = store_len
             if grid and aligned % grid:
                 aligned = aligned // grid * grid
             mamba_transfer_tokens = aligned
