@@ -75,7 +75,7 @@ def _split_stacked_pool(pool: object, name: str) -> object:
     return layers
 
 
-def _fold_page_native_pool(kv_pool: object) -> None:
+def _fold_page_native_pool(kv_pool: object) -> bool:
     """Fold a page-native NPU pool's per-layer buffers to slot-native rows.
 
     SGLang's NPU memory pools allocate each layer as
@@ -95,6 +95,12 @@ def _fold_page_native_pool(kv_pool: object) -> None:
     are not 4-D page-native (already slot-native, or mamba state) pass
     through.
 
+    Returns True when at least one buffer was re-viewed, so callers can
+    restore the engine-native layout afterwards (the fold is for the
+    connector's eyes only -- SGLang's own attention reads
+    ``pool.k_buffer[layer_id]`` every forward and must keep seeing the
+    page-native objects the engine created).
+
     把 page-native NPU 池的逐层缓冲折叠为 slot-native 行。
 
     SGLang 的 NPU 内存池把每层分配为 ``[页数, page_size, 头数, 维度]``，
@@ -109,6 +115,11 @@ def _fold_page_native_pool(kv_pool: object) -> None:
     block，页 0 保持 SGLang 的 padding-sink 语义（存储路径已通过
     ``allow_dummy_page`` 处理）。非 4-D page-native 的缓冲（已是
     slot-native、或 mamba 状态）原样通过。
+
+    至少一个缓冲被重视图时返回 True，供调用方随后还原引擎原生布局
+    （折叠只给连接器看——SGLang 自己的注意力每个 forward 都读
+    ``pool.k_buffer[layer_id]``，必须继续看到引擎创建的 page-native
+    原对象）。
     """
     # Third Party
     # 第三方依赖
@@ -116,7 +127,8 @@ def _fold_page_native_pool(kv_pool: object) -> None:
 
     page_size = getattr(kv_pool, "page_size", None)
     if not page_size or page_size <= 1:
-        return
+        return False
+    folded_any = False
     for attr in ("k_buffer", "v_buffer"):
         buffer = getattr(kv_pool, attr, None)
         if not isinstance(buffer, list):
@@ -130,13 +142,16 @@ def _fold_page_native_pool(kv_pool: object) -> None:
             ):
                 rows = layer.shape[0] * page_size
                 folded.append(layer.reshape(rows, layer.shape[2], layer.shape[3]))
+                folded_any = True
             else:
                 folded.append(layer)
         setattr(kv_pool, attr, folded)
-    logger.info(
-        "SGLang page-native pool folded to slot-native rows (page_size=%d)",
-        page_size,
-    )
+    if folded_any:
+        logger.info(
+            "SGLang page-native pool folded to slot-native rows (page_size=%d)",
+            page_size,
+        )
+    return folded_any
 
 
 def install_mp_connector_compat() -> None:
@@ -205,43 +220,55 @@ def install_mp_connector_compat() -> None:
             def _compat_resolve_pool_tensors(self, kv_pool):
                 k_buffer = getattr(kv_pool, "k_buffer", None)
                 v_buffer = getattr(kv_pool, "v_buffer", None)
-                # Split stacked tensors on the *pool object* before the
-                # original validator runs, so every downstream consumer
-                # in the original method sees per-layer lists.
-                # 在原校验器运行前于 *池对象* 上拆分堆叠张量，
-                # 使原方法内的所有下游消费者都看到逐层列表。
+                # Snapshot the engine-native buffer objects. The pool
+                # attributes are mutated below ONLY so the connector's
+                # validator/registration sees the per-layer slot-native
+                # layout it demands; SGLang's own attention re-reads
+                # ``pool.k_buffer[layer_id]`` on every forward through
+                # ``get_key_buffer``, so the pool must keep exposing the
+                # exact page-native objects the engine created. Leaving
+                # the folded views installed corrupts every attention
+                # call (garbage output under low load, PagedAttention
+                # acl failures under load).
+                # 先快照引擎原生的缓冲对象。下面仅在池属性上临时改装，
+                # 让连接器的校验/注册看到它要求的逐层 slot-native 布局；
+                # 而 SGLang 自己的注意力每个 forward 都经
+                # ``get_key_buffer`` 重读 ``pool.k_buffer[layer_id]``，
+                # 池必须继续暴露引擎创建的 page-native 原对象。若把
+                # 折叠视图留在池上，每次注意力调用都会读到错误布局
+                # （低负载输出乱码、高负载 PagedAttention acl 失败）。
+                snapshot = (k_buffer, v_buffer)
+                mutated = False
                 if isinstance(k_buffer, torch.Tensor) and k_buffer.dim() >= 2:
                     kv_pool.k_buffer = _split_stacked_pool(k_buffer, "k_buffer")
+                    mutated = True
                 if isinstance(v_buffer, torch.Tensor) and v_buffer.dim() >= 2:
                     kv_pool.v_buffer = _split_stacked_pool(v_buffer, "v_buffer")
-                # Page-native -> slot-native fold. SGLang's NPU pools keep
-                # each layer as ``[pages, page_size, H, D]`` (rows are
-                # *pages*), while the unified connector's contract is
-                # slot-native (rows are *tokens*, rows_per_block ==
-                # slots_per_block == page_size). Folding each per-layer
-                # view to ``[pages * page_size, H, D]`` -- truncating the
-                # padding sentinel page so the row count divides evenly --
-                # makes the geometry self-consistent: the group reports
-                # ``tensor_rows_per_block = (page_size,) * n_tensors``,
-                # and ``4757 pages`` becomes ``4756*128`` slot rows.
-                # Page-native -> slot-native 折叠。SGLang 的 NPU 池把每层
-                # 存成 ``[pages, page_size, H, D]``（行是"页"），而统一
-                # 连接器的契约是 slot-native（行是"槽"，rows_per_block ==
-                # slots_per_block == page_size）。把每个逐层视图折叠成
-                # ``[pages * page_size, H, D]``——截掉 padding 哨兵页使行
-                # 数整除——几何即自洽：组上报
-                # ``tensor_rows_per_block = (page_size,) * n_tensors``，
-                # ``4757 页`` 变为 ``4756*128`` 个槽行。
-                _fold_page_native_pool(kv_pool)
+                    mutated = True
+                # Page-native -> slot-native fold (connector-side view).
+                # Page-native -> slot-native 折叠（连接器侧视图）。
+                if _fold_page_native_pool(kv_pool):
+                    mutated = True
                 try:
                     return original_resolve(self, kv_pool)
                 finally:
-                    # The pool keeps the split lists (they are views of
-                    # the same storage), which is also what SGLang's own
-                    # runtime expects for the FIA layout; no restore.
-                    # 池保留拆分后的列表（同一存储的视图）——这也与
-                    # SGLang 运行时对 FIA 布局的期望一致；无需还原。
-                    pass
+                    if mutated:
+                        # Restore the engine-native layout. The connector
+                        # captured its own tensor references during
+                        # ``original_resolve`` (``self._kv_caches``), and
+                        # those zero-copy views share the same storage,
+                        # so transfers stay correct while the engine
+                        # keeps reading its native layout.
+                        # 还原引擎原生布局。连接器在 ``original_resolve``
+                        # 期间已捕获自己的张量引用（``self._kv_caches``），
+                        # 这些零拷贝视图与原对象共享同一存储，因此传输
+                        # 不受影响，而引擎继续使用原生布局。
+                        kv_pool.k_buffer, kv_pool.v_buffer = snapshot
+                        logger.info(
+                            "Restored engine-native KV pool layout after "
+                            "connector registration (connector keeps its "
+                            "own zero-copy views)"
+                        )
 
             _compat_resolve_pool_tensors.__name__ = (
                 "SGLangUnifiedKVAdapter._resolve_pool_tensors"
