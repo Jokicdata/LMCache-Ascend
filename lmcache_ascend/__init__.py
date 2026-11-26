@@ -206,6 +206,27 @@ def _patch_sglang_mp_connector_compat():
     install_mp_connector_compat()
 
 
+def _patch_kv_format_relay():
+    """Relay SGLang's two-list MHA layout onto the NPU per-layer tuple format.
+
+    Arms the lazy binding in ``lmcache.v1.platform.devices.npu`` so that the
+    server-side format detection yields the per-layer ``(K, V)`` layout the
+    Ascend block-level transfer kernel requires.
+
+    本函数在插件激活时无条件调用（它不依赖运行时是 SGLang 引擎还是
+    lmcache server），并委托 ``kv_format_relay.install_two_list_relay``
+    包装 ``NpuDeviceSpec.create_cache_context``，把绑定推迟到第一次构造
+    缓存上下文时。
+    """
+    # First Party
+    # 本项目模块
+    from lmcache_ascend.integration.sglang.kv_format_relay import (
+        install_two_list_relay,
+    )
+
+    install_two_list_relay()
+
+
 def _patch_sglang_unified_diversion():
     """Divert LMCRadixCache onto the unified path for hybrid/MLA/DSV4 pools.
 
@@ -277,5 +298,21 @@ if not LMCACHE_ASCEND_PATCHED:
                 )
 
     _patch_make_page_buffer_shape_desc()
+
+    # The format relay runs in the ``lmcache server`` process (where the
+    # NPU cache context performs format detection), so it is armed
+    # unconditionally rather than under the SGLang-engine check. Guarded
+    # separately: a failure here must not abort the activation, the store
+    # path simply resurfaces the original unsupported-format error.
+    # 格式桥接运行在 ``lmcache server`` 进程内（NPU 缓存上下文在那里做
+    # 格式检测），因此不走 SGLang 引擎的运行时判断，而是无条件武装。
+    # 单独守卫：这里失败不能中断激活，存储路径只会重新暴露原来的
+    # "不支持的格式"报错。
+    try:
+        _patch_kv_format_relay()
+    except Exception as exc:  # noqa: BLE001
+        init_logger(__name__).warning(
+            "%s not installed: %s", "_patch_kv_format_relay", exc
+        )
 
     LMCACHE_ASCEND_PATCHED = True
