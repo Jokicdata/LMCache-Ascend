@@ -75,6 +75,68 @@ def _split_stacked_pool(pool: object, name: str) -> object:
     return layers
 
 
+def _fold_page_native_layers(layers: object, page_size: int, name: str) -> object:
+    """Fold a per-layer list of page-native 4-D views to slot-native 3-D rows.
+
+    Legacy-connector counterpart of ``_fold_page_native_pool``: it works on
+    the flat ``k_pool`` / ``v_pool`` lists handed to ``LMCacheMPConnector``
+    instead of on a pool object.
+
+    On NPU each layer arrives as ``[pages, page_size, H, D]`` (4-D). LMCache's
+    SGLang format detector only recognises MHA when the tensors are 3-D
+    ``(PBS, NH, HS)`` -- a 4-D tensor skips that branch and is later
+    misclassified as the MLA layout (``NL_X_NB_BS_HS``, format 3), which the
+    Ascend block-level transfer kernel rejects. Folding dim 0 and dim 1 into
+    ``pages * page_size`` restores the shape the detector expects; its own
+    reshape by ``tokens_per_block`` then yields exactly the original
+    ``[pages, page_size, H, D]`` geometry, so the byte layout is unchanged.
+
+    Layers that are not 4-D page-native (already slot-native, or a non-NPU
+    3-D layout) pass through untouched.
+
+    返回把 page-native 的逐层 4-D 视图折叠为 slot-native 3-D 行后的列表。
+
+    这是 ``_fold_page_native_pool`` 的旧连接器版本：它作用于交给
+    ``LMCacheMPConnector`` 的扁平 ``k_pool`` / ``v_pool`` 列表，而不是池对象。
+
+    NPU 上每层张量的形状是 ``[页数, page_size, 头数, 维度]``（4 维）。
+    LMCache 的 SGLang 格式检测器只在张量为 3 维 ``(PBS, NH, HS)`` 时才
+    认作 MHA——4 维张量会跳过该分支，随后被误判为 MLA 布局
+    （``NL_X_NB_BS_HS``，格式 3），而昇腾的块级传输内核不支持该格式。
+    把第 0、1 维折叠为 ``页数 * page_size`` 即恢复检测器期望的形状；
+    检测器随后按 ``tokens_per_block`` 做的重塑会得到与原始
+    ``[页数, page_size, 头数, 维度]`` 完全相同的几何，字节布局不变。
+
+    非 4 维 page-native 的层（已是 slot-native，或非 NPU 的 3 维布局）
+    原样通过。
+    """
+    if not isinstance(layers, list) or not layers:
+        return layers
+    if not page_size or page_size <= 1:
+        return layers
+    if not all(
+        isinstance(layer, torch.Tensor)
+        and layer.dim() == 4
+        and layer.shape[1] == page_size
+        for layer in layers
+    ):
+        return layers
+    folded = [
+        layer.reshape(layer.shape[0] * page_size, layer.shape[2], layer.shape[3])
+        for layer in layers
+    ]
+    logger.info(
+        "SGLang page-native %s folded to slot-native rows: %d layers, "
+        "%s -> %s (page_size=%d)",
+        name,
+        len(folded),
+        tuple(layers[0].shape),
+        tuple(folded[0].shape),
+        page_size,
+    )
+    return folded
+
+
 def _fold_page_native_pool(kv_pool: object) -> bool:
     """Fold a page-native NPU pool's per-layer buffers to slot-native rows.
 
@@ -181,10 +243,19 @@ def install_mp_connector_compat() -> None:
     def _compat_init(self, *args, **kwargs):
         # Standard
         # 标准库
+        # ``page_size`` is a keyword of the wrapped constructor; fall back to
+        # positional argument 3 when a caller passes it positionally.
+        # ``page_size`` 是被包装构造函数的关键字参数；调用方按位置传参时
+        # 回退到第 4 个位置参数。
+        page_size = kwargs.get("page_size")
+        if page_size is None and len(args) > 3:
+            page_size = args[3]
         if "k_pool" in kwargs:
-            kwargs["k_pool"] = _split_stacked_pool(kwargs["k_pool"], "k_pool")
+            k_pool = _split_stacked_pool(kwargs["k_pool"], "k_pool")
+            kwargs["k_pool"] = _fold_page_native_layers(k_pool, page_size, "k_pool")
         if "v_pool" in kwargs:
-            kwargs["v_pool"] = _split_stacked_pool(kwargs["v_pool"], "v_pool")
+            v_pool = _split_stacked_pool(kwargs["v_pool"], "v_pool")
+            kwargs["v_pool"] = _fold_page_native_layers(v_pool, page_size, "v_pool")
         return original_init(self, *args, **kwargs)
 
     _compat_init.__name__ = "LMCacheMPConnector.__init__"
